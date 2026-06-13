@@ -1,4 +1,4 @@
-const CACHE = 'srs-prep-v3';
+const CACHE = 'srs-prep-v4';
 
 // Everything the app needs to run offline
 const PRECACHE = [

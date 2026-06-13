@@ -1,5 +1,5 @@
 import { createRoot } from 'react-dom/client';
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 
 /* ------------------------------------------------------------------ *
  *  DSA Spaced-Repetition Trainer
@@ -95,7 +95,9 @@ export default function App() {
     const [stats, setStats] = useState({ introduced: {}, reviewed: {} });
     // session
     const [queue, setQueue] = useState([]);
+    const [queueDate, setQueueDate] = useState(null); // "YYYY-MM-DD" the current queue was built/restored for
     const [revealed, setRevealed] = useState(false);
+    const restoredQueueRef = useRef(null); // queue restored from storage, consumed by the first buildQueue()
     const cards = useMemo(() => {
         const map = new Map(SEED.map((c) => [c.id, c]));
         extra.forEach((c) => { if (!map.has(c.id))
@@ -116,6 +118,12 @@ export default function App() {
                 setExtra(s.extra || []);
                 setSettings(s.settings || { newPerDay: 8, highPerDay: 3 });
                 setStats(s.stats || { introduced: {}, reviewed: {} });
+                // restore today's in-progress queue so a refresh picks up where you left off
+                if (s.queueDate === todayStr() && Array.isArray(s.queue)) {
+                    restoredQueueRef.current = s.queue;
+                    if (typeof s.revealed === "boolean")
+                        setRevealed(s.revealed);
+                }
             }
         }
         catch (e) { /* corrupted storage, start fresh */ }
@@ -127,7 +135,7 @@ export default function App() {
     /* ---- persist ---- */
     const persist = useCallback((next) => {
         const payload = {
-            sched, backs, extra, settings, stats, ...next,
+            sched, backs, extra, settings, stats, queue, queueDate, revealed, ...next,
         };
         if (next) {
             if (next.sched)
@@ -145,7 +153,7 @@ export default function App() {
             localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
         }
         catch (e) { /* non-fatal: storage quota */ }
-    }, [sched, backs, extra, settings, stats]);
+    }, [sched, backs, extra, settings, stats, queue, queueDate, revealed]);
     /* ---- derived counts ---- */
     const t = todayStr();
     const introducedToday = stats.introduced[t] || 0;
@@ -159,6 +167,17 @@ export default function App() {
     const learnedCount = cards.filter((c) => sched[c.id] && sched[c.id].status !== "new").length;
     /* ---- build session queue ---- */
     const buildQueue = useCallback(() => {
+        // pick up where we left off, if we have a valid queue saved for today
+        const restored = restoredQueueRef.current;
+        if (restored) {
+            restoredQueueRef.current = null;
+            const valid = restored.filter((id) => cardById.has(id));
+            if (valid.length > 0) {
+                setQueue(valid);
+                setQueueDate(t);
+                return;
+            }
+        }
         const allowed = Math.max(0, settings.newPerDay - introducedToday);
         const highAllowed = Math.max(0, settings.highPerDay - (stats.introduced[t + '_high'] || 0));
         const highNew = newCards.filter((c) => c.risk === 'High').slice(0, highAllowed);
@@ -169,11 +188,33 @@ export default function App() {
             ...otherNew.map((c) => c.id),
         ];
         setQueue(ids);
+        setQueueDate(t);
         setRevealed(false);
-    }, [dueCards, newCards, sched, settings.newPerDay, settings.highPerDay, introducedToday, stats, t]);
-    useEffect(() => { if (loaded)
-        buildQueue(); /* eslint-disable-next-line */ }, [loaded]);
+    }, [dueCards, newCards, sched, settings.newPerDay, settings.highPerDay, introducedToday, stats, t, cardById]);
+    useEffect(() => { if (loaded && queueDate === null)
+        buildQueue(); }, [loaded, queueDate, buildQueue]);
+    /* ---- persist queue position so a refresh picks up where you left off ---- */
+    useEffect(() => {
+        if (!loaded)
+            return;
+        persist();
+        /* eslint-disable-next-line */ }, [queue, queueDate, revealed]);
     const current = queue[0] ? cardById.get(queue[0]) : null;
+    /* ---- pull more new cards into today's queue (e.g. once you've cleared it), respecting the daily high-decay cap ---- */
+    const moreToPull = useMemo(() => {
+        const inQueue = new Set(queue);
+        const remainingNew = newCards.filter((c) => !inQueue.has(c.id));
+        const highAllowed = Math.max(0, settings.highPerDay - (stats.introduced[t + '_high'] || 0));
+        const highNew = remainingNew.filter((c) => c.risk === 'High').slice(0, highAllowed);
+        const otherNew = remainingNew.filter((c) => c.risk !== 'High');
+        return [...highNew, ...otherNew].slice(0, settings.newPerDay).map((c) => c.id);
+    }, [queue, newCards, settings.newPerDay, settings.highPerDay, stats, t]);
+    const pullMoreNew = useCallback(() => {
+        if (moreToPull.length === 0)
+            return;
+        setQueue((q) => [...q, ...moreToPull]);
+        setRevealed(false);
+    }, [moreToPull]);
     /* ---- rate ---- */
     const rate = (grade) => {
         if (!current)
@@ -227,7 +268,7 @@ export default function App() {
     return (React.createElement("div", { style: { fontFamily: SANS, color: T.ink, background: T.canvas, minHeight: "100vh" } },
         React.createElement("div", { className: "mx-auto", style: { maxWidth: 760, padding: "20px 18px 56px" } },
             React.createElement(Header, { view: view, setView: setView, due: dueCards.length, neu: Math.max(0, settings.newPerDay - introducedToday), learned: learnedCount, total: cards.length, streak: streak }),
-            view === "review" && (React.createElement(Review, { current: current, revealed: revealed, setRevealed: setRevealed, getSched: getSched, getBack: getBack, remaining: queue.length, rate: rate, upcoming: upcoming, maxBin: maxBin, nextDue: cards
+            view === "review" && (React.createElement(Review, { current: current, revealed: revealed, setRevealed: setRevealed, getSched: getSched, getBack: getBack, remaining: queue.length, rate: rate, upcoming: upcoming, maxBin: maxBin, pullCount: moreToPull.length, onPullMore: pullMoreNew, nextDue: cards
                     .map((c) => sched[c.id])
                     .filter((s) => s && s.status !== "new")
                     .map((s) => diffDays(t, s.due))
@@ -248,6 +289,9 @@ export default function App() {
                     setExtra([]);
                     setStats({ introduced: {}, reviewed: {} });
                     setSettings({ newPerDay: 8, highPerDay: 3 });
+                    setQueue([]);
+                    setQueueDate(null);
+                    setRevealed(false);
                     setView("review");
                 } })))));
 }
@@ -284,14 +328,21 @@ function Stat({ label, value, color }) {
         React.createElement("div", { style: { fontSize: 11, color: T.faint, textTransform: "uppercase", letterSpacing: 0.6 } }, label)));
 }
 /* ---------------------------- Review ---------------------------- */
-function Review({ current, revealed, setRevealed, getSched, getBack, remaining, rate, upcoming, maxBin, nextDue }) {
+function Review({ current, revealed, setRevealed, getSched, getBack, remaining, rate, upcoming, maxBin, nextDue, pullCount, onPullMore }) {
     if (!current)
         return (React.createElement("div", { style: { textAlign: "center", padding: "48px 16px" } },
             React.createElement("div", { style: { fontFamily: MONO, fontSize: 40, color: T.green } }, "\u2713"),
             React.createElement("p", { style: { fontSize: 16, fontWeight: 600, marginTop: 8 } }, "Queue clear for today"),
-            React.createElement("p", { style: { color: T.sub, fontSize: 13.5, marginTop: 4 } }, nextDue != null
-                ? `Next reviews come due in ${nextDue} day${nextDue === 1 ? "" : "s"}. Bump the new-card limit in Settings to pull more forward.`
-                : "Import your sheet or raise the new-card limit in Settings to add more cards."),
+            React.createElement("p", { style: { color: T.sub, fontSize: 13.5, marginTop: 4 } }, pullCount > 0
+                ? "You've cleared today's queue \u2014 pull in more below, or come back later."
+                : nextDue != null
+                    ? `Next reviews come due in ${nextDue} day${nextDue === 1 ? "" : "s"}.`
+                    : "Import your sheet to add more cards."),
+            pullCount > 0 && (React.createElement("button", { onClick: onPullMore, style: {
+                    marginTop: 14, padding: "10px 18px", cursor: "pointer",
+                    background: T.paper, color: T.indigo, border: `1.5px solid ${T.indigo}`, borderRadius: 10,
+                    fontFamily: SANS, fontSize: 13.5, fontWeight: 600,
+                } }, `Pull in ${pullCount} more new problem${pullCount === 1 ? "" : "s"}`)),
             React.createElement(UpcomingStrip, { upcoming: upcoming, maxBin: maxBin })));
     const s = getSched(current.id);
     const back = getBack(current.id);
