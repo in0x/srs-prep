@@ -91,7 +91,7 @@ export default function App() {
     const [sched, setSched] = useState({}); // id -> sched
     const [backs, setBacks] = useState({}); // id -> override text
     const [extra, setExtra] = useState([]); // imported cards beyond seed
-    const [settings, setSettings] = useState({ newPerDay: 8 });
+    const [settings, setSettings] = useState({ newPerDay: 8, highPerDay: 3 });
     const [stats, setStats] = useState({ introduced: {}, reviewed: {} });
     // session
     const [queue, setQueue] = useState([]);
@@ -114,7 +114,7 @@ export default function App() {
                 setSched(s.sched || {});
                 setBacks(s.backs || {});
                 setExtra(s.extra || []);
-                setSettings(s.settings || { newPerDay: 8 });
+                setSettings(s.settings || { newPerDay: 8, highPerDay: 3 });
                 setStats(s.stats || { introduced: {}, reviewed: {} });
             }
         }
@@ -160,13 +160,17 @@ export default function App() {
     /* ---- build session queue ---- */
     const buildQueue = useCallback(() => {
         const allowed = Math.max(0, settings.newPerDay - introducedToday);
+        const highAllowed = Math.max(0, settings.highPerDay - (stats.introduced[t + '_high'] || 0));
+        const highNew = newCards.filter((c) => c.risk === 'High').slice(0, highAllowed);
+        const otherNew = newCards.filter((c) => c.risk !== 'High').slice(0, Math.max(0, allowed - highNew.length));
         const ids = [
             ...dueCards.sort((a, b) => diffDays(sched[a.id].due, sched[b.id].due)).map((c) => c.id),
-            ...newCards.slice(0, allowed).map((c) => c.id),
+            ...highNew.map((c) => c.id),
+            ...otherNew.map((c) => c.id),
         ];
         setQueue(ids);
         setRevealed(false);
-    }, [dueCards, newCards, sched, settings.newPerDay, introducedToday]);
+    }, [dueCards, newCards, sched, settings.newPerDay, settings.highPerDay, introducedToday, stats, t]);
     useEffect(() => { if (loaded)
         buildQueue(); /* eslint-disable-next-line */ }, [loaded]);
     const current = queue[0] ? cardById.get(queue[0]) : null;
@@ -181,8 +185,11 @@ export default function App() {
             introduced: { ...stats.introduced },
             reviewed: { ...stats.reviewed, [t]: (stats.reviewed[t] || 0) + 1 },
         };
-        if (!was || was.status === "new")
+        if (!was || was.status === "new") {
             nStats.introduced[t] = (nStats.introduced[t] || 0) + 1;
+            if (current.risk === 'High')
+                nStats.introduced[t + '_high'] = (nStats.introduced[t + '_high'] || 0) + 1;
+        }
         // reorder queue: 'again' → back of line; else drop
         setQueue((q) => {
             const rest = q.slice(1);
@@ -231,7 +238,7 @@ export default function App() {
                     backs: { ...backs, ...newBacks },
                     extra: [...extra, ...newCards],
                 }) })),
-            view === "stats" && (React.createElement(Stats, { settings: settings, setNewPerDay: (n) => persist({ settings: { ...settings, newPerDay: n } }), upcoming: upcoming, maxBin: maxBin, learned: learnedCount, total: cards.length, streak: streak, onReset: () => {
+            view === "stats" && (React.createElement(Stats, { settings: settings, setNewPerDay: (n) => persist({ settings: { ...settings, newPerDay: n } }), setHighPerDay: (n) => persist({ settings: { ...settings, highPerDay: n } }), upcoming: upcoming, maxBin: maxBin, learned: learnedCount, total: cards.length, streak: streak, onReset: () => {
                     try {
                         localStorage.removeItem(STORAGE_KEY);
                     }
@@ -240,7 +247,7 @@ export default function App() {
                     setBacks({});
                     setExtra([]);
                     setStats({ introduced: {}, reviewed: {} });
-                    setSettings({ newPerDay: 8 });
+                    setSettings({ newPerDay: 8, highPerDay: 3 });
                     setView("review");
                 } })))));
 }
@@ -603,7 +610,7 @@ function Importer({ cardById, onApply }) {
     ));
 }
 /* ---------------------------- Stats / Settings ---------------------------- */
-function Stats({ settings, setNewPerDay, upcoming, maxBin, learned, total, streak, onReset }) {
+function Stats({ settings, setNewPerDay, setHighPerDay, upcoming, maxBin, learned, total, streak, onReset }) {
     const [confirm, setConfirm] = useState(false);
     return (React.createElement("div", { style: { marginTop: 16 } },
         React.createElement(Section, { title: "New cards per day" },
@@ -611,6 +618,11 @@ function Stats({ settings, setNewPerDay, upcoming, maxBin, learned, total, strea
             React.createElement("div", { className: "flex items-center", style: { gap: 12 } },
                 React.createElement("input", { type: "range", min: 2, max: 25, value: settings.newPerDay, onChange: (e) => setNewPerDay(Number(e.target.value)), style: { flex: 1, accentColor: T.indigo } }),
                 React.createElement("span", { style: { fontFamily: MONO, fontSize: 18, fontWeight: 600, width: 28, textAlign: "right" } }, settings.newPerDay))),
+        React.createElement(Section, { title: "High-decay cards per day" },
+            React.createElement("p", { style: { fontSize: 13, color: T.sub, marginBottom: 10 } }, "Cap on new High-decay problems introduced daily. Spreads hard problems across more sessions."),
+            React.createElement("div", { className: "flex items-center", style: { gap: 12 } },
+                React.createElement("input", { type: "range", min: 1, max: 10, value: settings.highPerDay, onChange: (e) => setHighPerDay(Number(e.target.value)), style: { flex: 1, accentColor: T.riskHigh } }),
+                React.createElement("span", { style: { fontFamily: MONO, fontSize: 18, fontWeight: 600, width: 28, textAlign: "right", color: T.riskHigh } }, settings.highPerDay))),
         React.createElement(Section, { title: "Progress" },
             React.createElement("div", { className: "flex", style: { gap: 16 } },
                 React.createElement(Mini, { label: "Learned", value: `${learned}/${total}`, color: T.green }),
