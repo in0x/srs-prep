@@ -311,8 +311,8 @@ function Review({ current, revealed, setRevealed, getSched, getBack, remaining, 
                             "."),
                         " ",
                         current.name),
-                    current.url ? React.createElement("a", {
-                        href: current.url,
+                    React.createElement("a", {
+                        href: "https://leetcode.com/problems/" + current.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") + "/",
                         target: "_blank",
                         rel: "noopener noreferrer",
                         style: {
@@ -322,7 +322,7 @@ function Review({ current, revealed, setRevealed, getSched, getBack, remaining, 
                             border: "1px solid " + T.indigo + "44", borderRadius: 999,
                             padding: "2px 9px",
                         }
-                    }, "↗ LeetCode") : null),
+                    }, "↗ LeetCode")),
                 React.createElement("span", { style: {
                         flexShrink: 0, fontFamily: MONO, fontSize: 11, fontWeight: 600,
                         color: RISK_COLOR[current.risk], border: "1px solid " + RISK_COLOR[current.risk] + "44",
