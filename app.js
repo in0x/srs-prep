@@ -483,11 +483,18 @@ function Importer({ cardById, onApply }) {
         try { localStorage.setItem(SHEET_URL_KEY, url); } catch(e) {}
     };
     const buildCsvUrl = (raw) => {
-        // Accept either the edit URL or the published CSV URL; normalise to CSV export
+        // Case 1: already a published-to-web URL (/e/ path) — use as-is, just ensure output=csv
+        if (raw.includes('/spreadsheets/d/e/')) {
+            try {
+                const u = new URL(raw);
+                u.searchParams.set('output', 'csv');
+                return u.toString();
+            } catch(e) { return null; }
+        }
+        // Case 2: regular edit/view URL (/d/SHEET_ID) — convert to export URL
         const m = raw.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
         if (!m) return null;
         const id = m[1];
-        // Try to extract gid (sheet tab)
         const gidM = raw.match(/[#&?]gid=(\d+)/);
         const gid = gidM ? gidM[1] : "0";
         return `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`;
