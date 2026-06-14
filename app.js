@@ -51,13 +51,15 @@ const diffDays = (a, b) => {
     return Math.round((new Date(by, bm - 1, bd) - new Date(ay, am - 1, ad)) / 86400000);
 };
 /* ---- SM-2 scheduling ---- */
-const newSched = () => ({ ease: 2.5, interval: 0, reps: 0, due: todayStr(), status: "new" });
+const newSched = () => ({ ease: 2.5, interval: 0, reps: 0, due: todayStr(), status: "new", struggleStreak: 0, implAt: 0 });
 function schedule(s, grade) {
     const t = todayStr();
     let { ease, interval, reps } = s;
+    const implAt = s.implAt || 0;
+    const struggleStreak = (grade === "again" || grade === "hard") ? (s.struggleStreak || 0) + 1 : 0;
     if (grade === "again") {
         ease = Math.max(1.3, ease - 0.2);
-        return { ease, interval: 0, reps: 0, due: t, status: "learning" };
+        return { ease, interval: 0, reps: 0, due: t, status: "learning", struggleStreak, implAt };
     }
     if (grade === "hard") {
         ease = Math.max(1.3, ease - 0.15);
@@ -74,7 +76,26 @@ function schedule(s, grade) {
         interval = reps <= 1 ? 4 : Math.round(interval * ease * 1.3);
     }
     interval = Math.max(1, interval);
-    return { ease, interval, reps, due: addDays(t, interval), status: "review" };
+    return { ease, interval, reps, due: addDays(t, interval), status: "review", struggleStreak, implAt };
+}
+/* ---- reimplement signal: struggle streak, chronic ease, or matured interval ---- */
+const REIMPL_REASON = {
+    struggling: "Failed recall twice in a row \u2014 relearn by coding it",
+    shaky: "Chronically low ease, even with occasional good grades",
+    verify: "Long interval \u2014 verify it still holds up in code",
+};
+function reimplementStatus(s) {
+    const struggleStreak = s.struggleStreak || 0;
+    const ease = s.ease ?? 2.5;
+    const interval = s.interval || 0;
+    const implAt = s.implAt || 0;
+    if (struggleStreak >= 2)
+        return "struggling";
+    if (ease <= 1.8)
+        return "shaky";
+    if (interval > 0 && interval >= Math.max(7, implAt * 2))
+        return "verify";
+    return null;
 }
 const previewInterval = (s, grade) => {
     const r = schedule(s, grade);
@@ -105,7 +126,10 @@ export default function App() {
         return Array.from(map.values());
     }, [extra]);
     const cardById = useMemo(() => new Map(cards.map((c) => [c.id, c])), [cards]);
-    const getSched = useCallback((id) => sched[id] || newSched(), [sched]);
+    const getSched = useCallback((id) => {
+        const s = sched[id] || newSched();
+        return { struggleStreak: 0, implAt: 0, ...s };
+    }, [sched]);
     const getBack = useCallback((id) => (backs[id] != null ? backs[id] : cardById.get(id)?.back || ""), [backs, cardById]);
     /* ---- load once ---- */
     useEffect(() => {
@@ -113,7 +137,30 @@ export default function App() {
             const raw = localStorage.getItem(STORAGE_KEY);
             if (raw) {
                 const s = JSON.parse(raw);
-                setSched(s.sched || {});
+                let loadedSched = s.sched || {};
+                let migrated = false;
+                const migratedSched = {};
+                for (const [id, cardSched] of Object.entries(loadedSched)) {
+                    if (cardSched.implAt === undefined) {
+                        migratedSched[id] = {
+                            ...cardSched,
+                            struggleStreak: cardSched.struggleStreak || 0,
+                            implAt: cardSched.interval || 0,
+                        };
+                        migrated = true;
+                    }
+                    else {
+                        migratedSched[id] = cardSched;
+                    }
+                }
+                if (migrated) {
+                    loadedSched = migratedSched;
+                    try {
+                        localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...s, sched: migratedSched }));
+                    }
+                    catch (e) { /* non-fatal: storage quota */ }
+                }
+                setSched(loadedSched);
                 setBacks(s.backs || {});
                 setExtra(s.extra || []);
                 setSettings(s.settings || { newPerDay: 8, highPerDay: 3 });
@@ -239,7 +286,15 @@ export default function App() {
         setRevealed(false);
         persist({ sched: ns, stats: nStats });
     };
-    /* ---- upcoming load (next 14d) ---- */
+    /* ---- mark implemented: clear struggle streak, nudge ease, record checkpoint ---- */
+    const markImplemented = useCallback((id) => {
+        const s = getSched(id);
+        const ns = {
+            ...sched,
+            [id]: { ...s, struggleStreak: 0, implAt: s.interval || 0, ease: Math.min(2.5, (s.ease ?? 2.5) + 0.15) },
+        };
+        persist({ sched: ns });
+    }, [sched, getSched, persist]);
     const upcoming = useMemo(() => {
         const bins = Array.from({ length: 15 }, () => 0);
         cards.forEach((c) => {
@@ -268,7 +323,7 @@ export default function App() {
     return (React.createElement("div", { style: { fontFamily: SANS, color: T.ink, background: T.canvas, minHeight: "100vh" } },
         React.createElement("div", { className: "mx-auto", style: { maxWidth: 760, padding: "20px 18px 56px" } },
             React.createElement(Header, { view: view, setView: setView, due: dueCards.length, neu: Math.max(0, settings.newPerDay - introducedToday), learned: learnedCount, total: cards.length, streak: streak }),
-            view === "review" && (React.createElement(Review, { current: current, revealed: revealed, setRevealed: setRevealed, getSched: getSched, getBack: getBack, remaining: queue.length, rate: rate, upcoming: upcoming, maxBin: maxBin, pullCount: moreToPull.length, onPullMore: pullMoreNew, nextDue: cards
+            view === "review" && (React.createElement(Review, { current: current, revealed: revealed, setRevealed: setRevealed, getSched: getSched, getBack: getBack, remaining: queue.length, rate: rate, onMarkImplemented: markImplemented, upcoming: upcoming, maxBin: maxBin, pullCount: moreToPull.length, onPullMore: pullMoreNew, nextDue: cards
                     .map((c) => sched[c.id])
                     .filter((s) => s && s.status !== "new")
                     .map((s) => diffDays(t, s.due))
@@ -328,7 +383,7 @@ function Stat({ label, value, color }) {
         React.createElement("div", { style: { fontSize: 11, color: T.faint, textTransform: "uppercase", letterSpacing: 0.6 } }, label)));
 }
 /* ---------------------------- Review ---------------------------- */
-function Review({ current, revealed, setRevealed, getSched, getBack, remaining, rate, upcoming, maxBin, nextDue, pullCount, onPullMore }) {
+function Review({ current, revealed, setRevealed, getSched, getBack, remaining, rate, onMarkImplemented, upcoming, maxBin, nextDue, pullCount, onPullMore }) {
     if (!current)
         return (React.createElement("div", { style: { textAlign: "center", padding: "48px 16px" } },
             React.createElement("div", { style: { fontFamily: MONO, fontSize: 40, color: T.green } }, "\u2713"),
@@ -346,6 +401,7 @@ function Review({ current, revealed, setRevealed, getSched, getBack, remaining, 
             React.createElement(UpcomingStrip, { upcoming: upcoming, maxBin: maxBin })));
     const s = getSched(current.id);
     const back = getBack(current.id);
+    const reimplReason = reimplementStatus(s);
     const grades = [
         ["again", "Again", T.red], ["hard", "Hard", T.amber],
         ["good", "Good", T.indigo], ["easy", "Easy", T.green],
@@ -381,13 +437,24 @@ function Review({ current, revealed, setRevealed, getSched, getBack, remaining, 
                             padding: "2px 9px",
                         }
                     }, "↗ LeetCode")),
-                React.createElement("span", { style: {
-                        flexShrink: 0, fontFamily: MONO, fontSize: 11, fontWeight: 600,
-                        color: RISK_COLOR[current.risk], border: "1px solid " + RISK_COLOR[current.risk] + "44",
-                        borderRadius: 999, padding: "2px 9px", marginTop: 4,
-                    } },
-                    current.risk,
-                    " decay")),
+                React.createElement("div", { style: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 5, flexShrink: 0, marginTop: 4 } },
+                    React.createElement("span", { style: {
+                            fontFamily: MONO, fontSize: 11, fontWeight: 600,
+                            color: RISK_COLOR[current.risk], border: "1px solid " + RISK_COLOR[current.risk] + "44",
+                            borderRadius: 999, padding: "2px 9px",
+                        } },
+                        current.risk,
+                        " decay"),
+                    reimplReason && (React.createElement("span", { title: REIMPL_REASON[reimplReason], style: {
+                            fontFamily: MONO, fontSize: 11, fontWeight: 600,
+                            color: T.indigo, border: "1px solid " + T.indigo + "44",
+                            borderRadius: 999, padding: "2px 9px",
+                        } }, "\uD83D\uDD27 Reimplement")),
+                    reimplReason && (React.createElement("button", { onClick: () => onMarkImplemented(current.id), title: "Reset this signal after you've coded it up again", style: {
+                            fontFamily: MONO, fontSize: 10.5, fontWeight: 600, cursor: "pointer",
+                            color: T.green, background: "none", border: `1px solid ${T.green}44`,
+                            borderRadius: 999, padding: "2px 9px",
+                        } }, "\u2713 Implemented")))),
             !revealed ? (React.createElement("div", { style: { marginTop: 22 } },
                 React.createElement("p", { style: { color: T.sub, fontSize: 14, lineHeight: 1.5 } }, "Recall before flipping: the core approach, the data structure, time / space complexity, and the edge case that bites."),
                 React.createElement("button", { onClick: () => setRevealed(true), style: {
@@ -458,6 +525,7 @@ function Browse({ cards, sched, getBack, t, onEdit }) {
         React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 6 } },
             filtered.map((c) => {
                 const st = statusOf(c.id);
+                const reimplR = reimplementStatus(sched[c.id] || {});
                 const isOpen = open === c.id;
                 return (React.createElement("div", { key: c.id, style: { background: T.paper, border: `1px solid ${T.line}`, borderRadius: 9 } },
                     React.createElement("button", { onClick: () => setOpen(isOpen ? null : c.id), className: "flex items-center justify-between", style: { width: "100%", padding: "10px 12px", background: "none", border: "none", cursor: "pointer", textAlign: "left" } },
@@ -465,6 +533,7 @@ function Browse({ cards, sched, getBack, t, onEdit }) {
                             React.createElement("span", { style: { fontFamily: MONO, fontSize: 12, color: T.faint, width: 38, flexShrink: 0 } }, c.num),
                             React.createElement("span", { style: { fontSize: 13.5, color: T.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, c.name)),
                         React.createElement("span", { className: "flex items-center", style: { gap: 8, flexShrink: 0 } },
+                            reimplR && React.createElement("span", { title: REIMPL_REASON[reimplR], style: { fontSize: 12 } }, "\uD83D\uDD27"),
                             React.createElement("span", { style: { width: 7, height: 7, borderRadius: 999, background: RISK_COLOR[c.risk] } }),
                             React.createElement("span", { style: { fontFamily: MONO, fontSize: 11, color: st.color, width: 30, textAlign: "right" } }, st.label))),
                     isOpen && (React.createElement("div", { style: { padding: "0 12px 12px" } },
