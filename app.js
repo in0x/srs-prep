@@ -206,7 +206,7 @@ export default function App() {
     const introducedToday = stats.introduced[t] || 0;
     const dueCards = useMemo(() => cards.filter((c) => {
         const s = sched[c.id];
-        return s && s.status !== "new" && diffDays(s.due, t) <= 0;
+        return s && s.status !== "new" && diffDays(t, s.due) <= 0;
     }), [cards, sched, t]);
     const newCards = useMemo(() => cards
         .filter((c) => !sched[c.id] || sched[c.id].status === "new")
@@ -230,7 +230,7 @@ export default function App() {
         const highNew = newCards.filter((c) => c.risk === 'High').slice(0, highAllowed);
         const otherNew = newCards.filter((c) => c.risk !== 'High').slice(0, Math.max(0, allowed - highNew.length));
         const ids = [
-            ...dueCards.sort((a, b) => diffDays(sched[a.id].due, sched[b.id].due)).map((c) => c.id),
+            ...dueCards.sort((a, b) => diffDays(sched[b.id].due, sched[a.id].due)).map((c) => c.id),
             ...highNew.map((c) => c.id),
             ...otherNew.map((c) => c.id),
         ];
