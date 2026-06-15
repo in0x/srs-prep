@@ -34,6 +34,23 @@ const SEED = SEED_DATA.map((c) => ({
 }));
 const RISK_RANK = { High: 0, Med: 1, Low: 2 };
 const RISK_COLOR = { High: T.riskHigh, Med: T.riskMed, Low: T.riskLow };
+/* ---- all category values present in the seed deck, for the Settings multi-select ---- */
+const ALL_CATEGORIES = Array.from(new Set(SEED.map((c) => c.cat))).sort();
+/* ---- "Embedded-flavor" preset: categories prep.md flags as high-yield for an
+ * embedded/platform XR loop (arrays/strings, bit manip, graphs/BFS-DFS, sliding
+ * window, two pointers, heaps) ---- */
+const EMBEDDED_PRESET = [
+    "Arrays & Hashing", "Two Pointers", "Sliding Window", "Bit Manipulation",
+    "Trees", "Graphs", "Advanced Graphs", "Heap / Priority Queue",
+];
+/* ---- default settings: split daily new-card intake between priority and
+ * standard category pools (sum = effective newPerDay) ---- */
+const DEFAULT_SETTINGS = {
+    highPerDay: 3,
+    priorityPerDay: 5,
+    standardPerDay: 3,
+    priorityCategories: EMBEDDED_PRESET,
+};
 /* ---- date helpers (local, day-grained) ---- */
 const todayStr = () => {
     const d = new Date();
@@ -112,7 +129,7 @@ export default function App() {
     const [sched, setSched] = useState({}); // id -> sched
     const [backs, setBacks] = useState({}); // id -> override text
     const [extra, setExtra] = useState([]); // imported cards beyond seed
-    const [settings, setSettings] = useState({ newPerDay: 8, highPerDay: 3 });
+    const [settings, setSettings] = useState(DEFAULT_SETTINGS);
     const [stats, setStats] = useState({ introduced: {}, reviewed: {} });
     // session
     const [queue, setQueue] = useState([]);
@@ -163,7 +180,24 @@ export default function App() {
                 setSched(loadedSched);
                 setBacks(s.backs || {});
                 setExtra(s.extra || []);
-                setSettings(s.settings || { newPerDay: 8, highPerDay: 3 });
+                // migrate pre-existing settings: old shape had a single `newPerDay`
+                // and no priority-category split. Preserve the user's total intake
+                // by mapping it onto the new priorityPerDay/standardPerDay sliders,
+                // defaulting priority categories to the embedded-flavor preset.
+                const loadedSettings = s.settings || {};
+                let migratedSettings = loadedSettings;
+                if (loadedSettings.priorityPerDay === undefined || loadedSettings.standardPerDay === undefined) {
+                    const total = loadedSettings.newPerDay ?? DEFAULT_SETTINGS.priorityPerDay + DEFAULT_SETTINGS.standardPerDay;
+                    const priorityPerDay = Math.max(0, Math.min(total, Math.round(total * 0.6)));
+                    migratedSettings = {
+                        ...DEFAULT_SETTINGS,
+                        ...loadedSettings,
+                        priorityPerDay,
+                        standardPerDay: Math.max(0, total - priorityPerDay),
+                        priorityCategories: loadedSettings.priorityCategories || EMBEDDED_PRESET,
+                    };
+                }
+                setSettings(migratedSettings);
                 setStats(s.stats || { introduced: {}, reviewed: {} });
                 // restore today's in-progress queue so a refresh picks up where you left off
                 if (s.queueDate === todayStr() && Array.isArray(s.queue)) {
@@ -212,6 +246,27 @@ export default function App() {
         .filter((c) => !sched[c.id] || sched[c.id].status === "new")
         .sort((a, b) => RISK_RANK[a.risk] - RISK_RANK[b.risk] || a.order - b.order), [cards, sched]);
     const learnedCount = cards.filter((c) => sched[c.id] && sched[c.id].status !== "new").length;
+    /* ---- split new cards into priority / standard pools by category ---- */
+    const prioritySet = useMemo(() => new Set(settings.priorityCategories || []), [settings.priorityCategories]);
+    const priorityNewCards = useMemo(() => newCards.filter((c) => prioritySet.has(c.cat)), [newCards, prioritySet]);
+    const standardNewCards = useMemo(() => newCards.filter((c) => !prioritySet.has(c.cat)), [newCards, prioritySet]);
+    /* ---- select up to `allowed` cards from a pool, respecting a shared
+     * High-decay cap (`highRemaining`, mutated in place so callers can chain
+     * pools and keep the cap global rather than per-pool) ---- */
+    const selectFromPool = (pool, allowed, highRemaining) => {
+        const picked = [];
+        for (const c of pool) {
+            if (picked.length >= allowed)
+                break;
+            if (c.risk === 'High') {
+                if (highRemaining.n <= 0)
+                    continue;
+                highRemaining.n -= 1;
+            }
+            picked.push(c);
+        }
+        return picked;
+    };
     /* ---- build session queue ---- */
     const buildQueue = useCallback(() => {
         // pick up where we left off, if we have a valid queue saved for today
@@ -225,19 +280,39 @@ export default function App() {
                 return;
             }
         }
-        const allowed = Math.max(0, settings.newPerDay - introducedToday);
-        const highAllowed = Math.max(0, settings.highPerDay - (stats.introduced[t + '_high'] || 0));
-        const highNew = newCards.filter((c) => c.risk === 'High').slice(0, highAllowed);
-        const otherNew = newCards.filter((c) => c.risk !== 'High').slice(0, Math.max(0, allowed - highNew.length));
+        const allowed = Math.max(0, (settings.priorityPerDay + settings.standardPerDay) - introducedToday);
+        const highRemaining = { n: Math.max(0, settings.highPerDay - (stats.introduced[t + '_high'] || 0)) };
+        // each tier gets its own slider-sized budget, but if `allowed` (today's
+        // remaining total) is smaller than the sum of the two sliders (e.g. you've
+        // already introduced some cards today), shrink both proportionally
+        const priorityBudget = Math.min(settings.priorityPerDay, allowed);
+        const standardBudget = Math.min(settings.standardPerDay, Math.max(0, allowed - priorityBudget));
+        let picked = selectFromPool(priorityNewCards, priorityBudget, highRemaining);
+        let standardPicked = selectFromPool(standardNewCards, standardBudget, highRemaining);
+        // rollover: if either pool came up short, top up from the other pool
+        // with whatever remains of today's total budget
+        const usedSoFar = picked.length + standardPicked.length;
+        let remaining = Math.max(0, allowed - usedSoFar);
+        if (remaining > 0) {
+            const pickedIds = new Set([...picked, ...standardPicked].map((c) => c.id));
+            const fillFromStandard = selectFromPool(standardNewCards.filter((c) => !pickedIds.has(c.id)), remaining, highRemaining);
+            remaining -= fillFromStandard.length;
+            standardPicked = [...standardPicked, ...fillFromStandard];
+            if (remaining > 0) {
+                const pickedIds2 = new Set([...picked, ...standardPicked].map((c) => c.id));
+                const fillFromPriority = selectFromPool(priorityNewCards.filter((c) => !pickedIds2.has(c.id)), remaining, highRemaining);
+                picked = [...picked, ...fillFromPriority];
+            }
+        }
+        const newSelection = [...picked, ...standardPicked];
         const ids = [
             ...dueCards.sort((a, b) => diffDays(sched[b.id].due, sched[a.id].due)).map((c) => c.id),
-            ...highNew.map((c) => c.id),
-            ...otherNew.map((c) => c.id),
+            ...newSelection.map((c) => c.id),
         ];
         setQueue(ids);
         setQueueDate(t);
         setRevealed(false);
-    }, [dueCards, newCards, sched, settings.newPerDay, settings.highPerDay, introducedToday, stats, t, cardById]);
+    }, [dueCards, priorityNewCards, standardNewCards, sched, settings.priorityPerDay, settings.standardPerDay, settings.highPerDay, introducedToday, stats, t, cardById]);
     useEffect(() => { if (loaded && queueDate === null)
         buildQueue(); }, [loaded, queueDate, buildQueue]);
     /* ---- persist queue position so a refresh picks up where you left off ---- */
@@ -250,12 +325,28 @@ export default function App() {
     /* ---- pull more new cards into today's queue (e.g. once you've cleared it), respecting the daily high-decay cap ---- */
     const moreToPull = useMemo(() => {
         const inQueue = new Set(queue);
-        const remainingNew = newCards.filter((c) => !inQueue.has(c.id));
-        const highAllowed = Math.max(0, settings.highPerDay - (stats.introduced[t + '_high'] || 0));
-        const highNew = remainingNew.filter((c) => c.risk === 'High').slice(0, highAllowed);
-        const otherNew = remainingNew.filter((c) => c.risk !== 'High');
-        return [...highNew, ...otherNew].slice(0, settings.newPerDay).map((c) => c.id);
-    }, [queue, newCards, settings.newPerDay, settings.highPerDay, stats, t]);
+        const remainingPriority = priorityNewCards.filter((c) => !inQueue.has(c.id));
+        const remainingStandard = standardNewCards.filter((c) => !inQueue.has(c.id));
+        const total = settings.priorityPerDay + settings.standardPerDay;
+        const highRemaining = { n: Math.max(0, settings.highPerDay - (stats.introduced[t + '_high'] || 0)) };
+        const priorityBudget = Math.min(settings.priorityPerDay, total);
+        const standardBudget = Math.min(settings.standardPerDay, Math.max(0, total - priorityBudget));
+        let picked = selectFromPool(remainingPriority, priorityBudget, highRemaining);
+        let standardPicked = selectFromPool(remainingStandard, standardBudget, highRemaining);
+        let remaining = Math.max(0, total - picked.length - standardPicked.length);
+        if (remaining > 0) {
+            const pickedIds = new Set([...picked, ...standardPicked].map((c) => c.id));
+            const fillFromStandard = selectFromPool(remainingStandard.filter((c) => !pickedIds.has(c.id)), remaining, highRemaining);
+            remaining -= fillFromStandard.length;
+            standardPicked = [...standardPicked, ...fillFromStandard];
+            if (remaining > 0) {
+                const pickedIds2 = new Set([...picked, ...standardPicked].map((c) => c.id));
+                const fillFromPriority = selectFromPool(remainingPriority.filter((c) => !pickedIds2.has(c.id)), remaining, highRemaining);
+                picked = [...picked, ...fillFromPriority];
+            }
+        }
+        return [...picked, ...standardPicked].map((c) => c.id);
+    }, [queue, priorityNewCards, standardNewCards, settings.priorityPerDay, settings.standardPerDay, settings.highPerDay, stats, t]);
     const pullMoreNew = useCallback(() => {
         if (moreToPull.length === 0)
             return;
@@ -322,7 +413,7 @@ export default function App() {
         return (React.createElement("div", { style: { fontFamily: SANS, background: T.canvas, minHeight: "100vh" } }));
     return (React.createElement("div", { style: { fontFamily: SANS, color: T.ink, background: T.canvas, minHeight: "100vh" } },
         React.createElement("div", { className: "mx-auto", style: { maxWidth: 760, padding: "20px 18px 56px" } },
-            React.createElement(Header, { view: view, setView: setView, due: dueCards.length, neu: Math.max(0, settings.newPerDay - introducedToday), learned: learnedCount, total: cards.length, streak: streak }),
+            React.createElement(Header, { view: view, setView: setView, due: dueCards.length, neu: Math.max(0, (settings.priorityPerDay + settings.standardPerDay) - introducedToday), learned: learnedCount, total: cards.length, streak: streak }),
             view === "review" && (React.createElement(Review, { current: current, revealed: revealed, setRevealed: setRevealed, getSched: getSched, getBack: getBack, remaining: queue.length, rate: rate, onMarkImplemented: markImplemented, upcoming: upcoming, maxBin: maxBin, pullCount: moreToPull.length, onPullMore: pullMoreNew, nextDue: cards
                     .map((c) => sched[c.id])
                     .filter((s) => s && s.status !== "new")
@@ -334,7 +425,7 @@ export default function App() {
                     backs: { ...backs, ...newBacks },
                     extra: [...extra, ...newCards],
                 }) })),
-            view === "stats" && (React.createElement(Stats, { settings: settings, setNewPerDay: (n) => persist({ settings: { ...settings, newPerDay: n } }), setHighPerDay: (n) => persist({ settings: { ...settings, highPerDay: n } }), upcoming: upcoming, maxBin: maxBin, learned: learnedCount, total: cards.length, streak: streak, onReset: () => {
+            view === "stats" && (React.createElement(Stats, { settings: settings, setPriorityPerDay: (n) => persist({ settings: { ...settings, priorityPerDay: n } }), setStandardPerDay: (n) => persist({ settings: { ...settings, standardPerDay: n } }), setHighPerDay: (n) => persist({ settings: { ...settings, highPerDay: n } }), setPriorityCategories: (cats) => persist({ settings: { ...settings, priorityCategories: cats } }), upcoming: upcoming, maxBin: maxBin, learned: learnedCount, total: cards.length, streak: streak, onReset: () => {
                     try {
                         localStorage.removeItem(STORAGE_KEY);
                     }
@@ -343,7 +434,7 @@ export default function App() {
                     setBacks({});
                     setExtra([]);
                     setStats({ introduced: {}, reviewed: {} });
-                    setSettings({ newPerDay: 8, highPerDay: 3 });
+                    setSettings(DEFAULT_SETTINGS);
                     setQueue([]);
                     setQueueDate(null);
                     setRevealed(false);
@@ -730,16 +821,50 @@ function Importer({ cardById, onApply }) {
     ));
 }
 /* ---------------------------- Stats / Settings ---------------------------- */
-function Stats({ settings, setNewPerDay, setHighPerDay, upcoming, maxBin, learned, total, streak, onReset }) {
+function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, setPriorityCategories, upcoming, maxBin, learned, total, streak, onReset }) {
     const [confirm, setConfirm] = useState(false);
+    const priorityCategories = settings.priorityCategories || [];
+    const toggleCategory = (cat) => {
+        if (priorityCategories.includes(cat)) {
+            setPriorityCategories(priorityCategories.filter((c) => c !== cat));
+        }
+        else {
+            setPriorityCategories([...priorityCategories, cat]);
+        }
+    };
+    const applyPreset = () => setPriorityCategories(EMBEDDED_PRESET);
     return (React.createElement("div", { style: { marginTop: 16 } },
-        React.createElement(Section, { title: "New cards per day" },
-            React.createElement("p", { style: { fontSize: 13, color: T.sub, marginBottom: 10 } }, "How many unseen problems to introduce daily. High-decay topics come first."),
+        React.createElement(Section, { title: "Priority-category new cards per day" },
+            React.createElement("p", { style: { fontSize: 13, color: T.sub, marginBottom: 10 } }, "How many unseen problems from your priority categories (below) to introduce daily. High-decay topics come first within each pool."),
             React.createElement("div", { className: "flex items-center", style: { gap: 12 } },
-                React.createElement("input", { type: "range", min: 2, max: 25, value: settings.newPerDay, onChange: (e) => setNewPerDay(Number(e.target.value)), style: { flex: 1, accentColor: T.indigo } }),
-                React.createElement("span", { style: { fontFamily: MONO, fontSize: 18, fontWeight: 600, width: 28, textAlign: "right" } }, settings.newPerDay))),
+                React.createElement("input", { type: "range", min: 0, max: 20, value: settings.priorityPerDay, onChange: (e) => setPriorityPerDay(Number(e.target.value)), style: { flex: 1, accentColor: T.indigo } }),
+                React.createElement("span", { style: { fontFamily: MONO, fontSize: 18, fontWeight: 600, width: 28, textAlign: "right" } }, settings.priorityPerDay))),
+        React.createElement(Section, { title: "Standard-category new cards per day" },
+            React.createElement("p", { style: { fontSize: 13, color: T.sub, marginBottom: 10 } }, "How many unseen problems from everything else to introduce daily. Keeps non-priority patterns from going stale. If one pool runs out for the day, the other fills the remainder."),
+            React.createElement("div", { className: "flex items-center", style: { gap: 12 } },
+                React.createElement("input", { type: "range", min: 0, max: 20, value: settings.standardPerDay, onChange: (e) => setStandardPerDay(Number(e.target.value)), style: { flex: 1, accentColor: T.indigo } }),
+                React.createElement("span", { style: { fontFamily: MONO, fontSize: 18, fontWeight: 600, width: 28, textAlign: "right" } }, settings.standardPerDay))),
+        React.createElement(Section, { title: "Priority categories" },
+            React.createElement("div", { className: "flex items-center justify-between", style: { marginBottom: 10 } },
+                React.createElement("p", { style: { fontSize: 13, color: T.sub, margin: 0 } }, "Categories that draw from the priority pool above."),
+                React.createElement("button", { onClick: applyPreset, style: {
+                        padding: "6px 10px", cursor: "pointer", background: T.paper, color: T.indigo,
+                        border: `1.5px solid ${T.indigo}`, borderRadius: 8, fontFamily: SANS, fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", marginLeft: 12,
+                    } }, "Embedded-flavor preset")),
+            React.createElement("div", { className: "flex", style: { gap: 6, flexWrap: "wrap" } }, ALL_CATEGORIES.map((cat) => {
+                const active = priorityCategories.includes(cat);
+                return React.createElement("button", {
+                    key: cat, onClick: () => toggleCategory(cat), style: {
+                        padding: "6px 10px", cursor: "pointer",
+                        background: active ? T.indigo : T.paper,
+                        color: active ? T.paper : T.sub,
+                        border: `1px solid ${active ? T.indigo : T.line}`,
+                        borderRadius: 999, fontFamily: SANS, fontSize: 12, fontWeight: 600,
+                    },
+                }, cat);
+            }))),
         React.createElement(Section, { title: "High-decay cards per day" },
-            React.createElement("p", { style: { fontSize: 13, color: T.sub, marginBottom: 10 } }, "Cap on new High-decay problems introduced daily. Spreads hard problems across more sessions."),
+            React.createElement("p", { style: { fontSize: 13, color: T.sub, marginBottom: 10 } }, "Cap on new High-decay problems introduced daily (shared across both pools above). Spreads hard problems across more sessions."),
             React.createElement("div", { className: "flex items-center", style: { gap: 12 } },
                 React.createElement("input", { type: "range", min: 1, max: 10, value: settings.highPerDay, onChange: (e) => setHighPerDay(Number(e.target.value)), style: { flex: 1, accentColor: T.riskHigh } }),
                 React.createElement("span", { style: { fontFamily: MONO, fontSize: 18, fontWeight: 600, width: 28, textAlign: "right", color: T.riskHigh } }, settings.highPerDay))),
