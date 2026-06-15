@@ -425,7 +425,77 @@ export default function App() {
                     backs: { ...backs, ...newBacks },
                     extra: [...extra, ...newCards],
                 }) })),
-            view === "stats" && (React.createElement(Stats, { settings: settings, setPriorityPerDay: (n) => persist({ settings: { ...settings, priorityPerDay: n } }), setStandardPerDay: (n) => persist({ settings: { ...settings, standardPerDay: n } }), setHighPerDay: (n) => persist({ settings: { ...settings, highPerDay: n } }), setPriorityCategories: (cats) => persist({ settings: { ...settings, priorityCategories: cats } }), upcoming: upcoming, maxBin: maxBin, learned: learnedCount, total: cards.length, streak: streak, onReset: () => {
+            view === "stats" && (React.createElement(Stats, { settings: settings, setPriorityPerDay: (n) => persist({ settings: { ...settings, priorityPerDay: n } }), setStandardPerDay: (n) => persist({ settings: { ...settings, standardPerDay: n } }), setHighPerDay: (n) => persist({ settings: { ...settings, highPerDay: n } }), setPriorityCategories: (cats) => persist({ settings: { ...settings, priorityCategories: cats } }), upcoming: upcoming, maxBin: maxBin, learned: learnedCount, total: cards.length, streak: streak, onExport: () => {
+                    const payload = {
+                        sched, backs, extra, settings, stats, queue, queueDate, revealed,
+                        exportedAt: new Date().toISOString(),
+                        version: STORAGE_KEY,
+                    };
+                    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `recall-queue-backup-${todayStr()}.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                }, onImport: (s) => {
+                    // Run the same migrations the load-on-boot path applies, so
+                    // imported backups from older app versions don't crash or
+                    // flood with stale "verify" badges.
+                    let loadedSched = s.sched || {};
+                    const migratedSched = {};
+                    for (const [id, cardSched] of Object.entries(loadedSched)) {
+                        if (cardSched.implAt === undefined) {
+                            migratedSched[id] = {
+                                ...cardSched,
+                                struggleStreak: cardSched.struggleStreak || 0,
+                                implAt: cardSched.interval || 0,
+                            };
+                        }
+                        else {
+                            migratedSched[id] = cardSched;
+                        }
+                    }
+                    const loadedSettings = s.settings || {};
+                    let migratedSettings = loadedSettings;
+                    if (loadedSettings.priorityPerDay === undefined || loadedSettings.standardPerDay === undefined) {
+                        const total = loadedSettings.newPerDay ?? DEFAULT_SETTINGS.priorityPerDay + DEFAULT_SETTINGS.standardPerDay;
+                        const priorityPerDay = Math.max(0, Math.min(total, Math.round(total * 0.6)));
+                        migratedSettings = {
+                            ...DEFAULT_SETTINGS,
+                            ...loadedSettings,
+                            priorityPerDay,
+                            standardPerDay: Math.max(0, total - priorityPerDay),
+                            priorityCategories: loadedSettings.priorityCategories || EMBEDDED_PRESET,
+                        };
+                    }
+                    const newStats = s.stats || { introduced: {}, reviewed: {} };
+                    const newExtra = s.extra || [];
+                    const newBacks = s.backs || {};
+                    const restoreQueue = s.queueDate === todayStr() && Array.isArray(s.queue);
+                    setSched(migratedSched);
+                    setBacks(newBacks);
+                    setExtra(newExtra);
+                    setSettings(migratedSettings);
+                    setStats(newStats);
+                    setQueue(restoreQueue ? s.queue : []);
+                    setQueueDate(restoreQueue ? s.queueDate : null);
+                    setRevealed(restoreQueue && typeof s.revealed === "boolean" ? s.revealed : false);
+                    if (restoreQueue)
+                        restoredQueueRef.current = s.queue;
+                    try {
+                        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+                            sched: migratedSched, backs: newBacks, extra: newExtra,
+                            settings: migratedSettings, stats: newStats,
+                            queue: restoreQueue ? s.queue : [],
+                            queueDate: restoreQueue ? s.queueDate : null,
+                            revealed: restoreQueue ? (s.revealed || false) : false,
+                        }));
+                    }
+                    catch (e) { /* non-fatal: storage quota */ }
+                }, onReset: () => {
                     try {
                         localStorage.removeItem(STORAGE_KEY);
                     }
@@ -821,8 +891,31 @@ function Importer({ cardById, onApply }) {
     ));
 }
 /* ---------------------------- Stats / Settings ---------------------------- */
-function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, setPriorityCategories, upcoming, maxBin, learned, total, streak, onReset }) {
+function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, setPriorityCategories, upcoming, maxBin, learned, total, streak, onExport, onImport, onReset }) {
     const [confirm, setConfirm] = useState(false);
+    const [importMsg, setImportMsg] = useState(null); // { ok: bool, text: string }
+    const fileInputRef = useRef(null);
+    const handleFile = (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file)
+            return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            try {
+                const data = JSON.parse(reader.result);
+                if (typeof data !== "object" || data === null || (!data.sched && !data.settings)) {
+                    throw new Error("not a recognized backup");
+                }
+                onImport(data);
+                setImportMsg({ ok: true, text: `Restored backup${data.exportedAt ? ` from ${new Date(data.exportedAt).toLocaleString()}` : ""}.` });
+            }
+            catch (err) {
+                setImportMsg({ ok: false, text: "Couldn't read that file — make sure it's a Recall·Queue export." });
+            }
+        };
+        reader.readAsText(file);
+        e.target.value = ""; // allow re-selecting the same file later
+    };
     const priorityCategories = settings.priorityCategories || [];
     const toggleCategory = (cat) => {
         if (priorityCategories.includes(cat)) {
@@ -874,6 +967,19 @@ function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, 
                 React.createElement(Mini, { label: "Streak", value: `${streak}d`, color: T.indigo }),
                 React.createElement(Mini, { label: "Due now", value: upcoming[0], color: T.amber })),
             React.createElement(UpcomingStrip, { upcoming: upcoming, maxBin: maxBin })),
+        React.createElement(Section, { title: "Backup" },
+            React.createElement("p", { style: { fontSize: 13, color: T.sub, marginBottom: 10 } }, "Export your scheduling data, notes, and stats as a JSON file. Restore from a backup to overwrite your current progress on this device."),
+            React.createElement("div", { className: "flex", style: { gap: 8, flexWrap: "wrap" } },
+                React.createElement("button", { onClick: onExport, style: {
+                        padding: "9px 14px", cursor: "pointer", background: T.indigo, color: T.paper,
+                        border: "none", borderRadius: 9, fontFamily: SANS, fontSize: 13.5, fontWeight: 600,
+                    } }, "Export backup"),
+                React.createElement("button", { onClick: () => fileInputRef.current && fileInputRef.current.click(), style: {
+                        padding: "9px 14px", cursor: "pointer", background: T.paper, color: T.indigo,
+                        border: `1.5px solid ${T.indigo}`, borderRadius: 9, fontFamily: SANS, fontSize: 13.5, fontWeight: 600,
+                    } }, "Restore from file"),
+                React.createElement("input", { ref: fileInputRef, type: "file", accept: "application/json,.json", onChange: handleFile, style: { display: "none" } })),
+            importMsg && (React.createElement("p", { style: { fontSize: 12.5, marginTop: 8, color: importMsg.ok ? T.green : T.red } }, importMsg.text))),
         React.createElement(Section, { title: "Reset" },
             React.createElement("p", { style: { fontSize: 13, color: T.sub, marginBottom: 10 } }, "Clears all scheduling, imported notes, and stats. This can't be undone."),
             !confirm ? (React.createElement("button", { onClick: () => setConfirm(true), style: {
