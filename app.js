@@ -381,7 +381,7 @@ export default function App() {
                 picked = [...picked, ...fillFromPriority];
             }
         }
-        return [...picked, ...standardPicked].map((c) => c.id);
+        return [...picked, ...standardPicked].slice(0, 1).map((c) => c.id);
     }, [queue, priorityNewCards, standardNewCards, settings.priorityPerDay, settings.standardPerDay, settings.highPerDay, stats, t]);
     const pullMoreNew = useCallback(() => {
         if (moreToPull.length === 0)
@@ -594,7 +594,7 @@ function Review({ current, revealed, setRevealed, getSched, getBack, remaining, 
                     marginTop: 14, padding: "10px 18px", cursor: "pointer",
                     background: T.paper, color: T.indigo, border: `1.5px solid ${T.indigo}`, borderRadius: 10,
                     fontFamily: SANS, fontSize: 13.5, fontWeight: 600,
-                } }, `Pull in ${pullCount} more new problem${pullCount === 1 ? "" : "s"}`)),
+                } }, "Pull in 1 more problem")),
             React.createElement(UpcomingStrip, { upcoming: upcoming, maxBin: maxBin })));
     const s = getSched(current.id);
     const back = getBack(current.id);
