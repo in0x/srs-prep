@@ -34,6 +34,26 @@ const SEED = SEED_DATA.map((c) => ({
 }));
 const RISK_RANK = { High: 0, Med: 1, Low: 2 };
 const RISK_COLOR = { High: T.riskHigh, Med: T.riskMed, Low: T.riskLow };
+/* Round-robin interleave across categories: takes one card from each category
+ * in turn until all are exhausted. Input should already be sorted within each
+ * category by the desired intra-category order (e.g. a.order - b.order). */
+function roundRobinByCategory(cards) {
+    const byCategory = new Map();
+    for (const c of cards) {
+        if (!byCategory.has(c.cat)) byCategory.set(c.cat, []);
+        byCategory.get(c.cat).push(c);
+    }
+    const queues = Array.from(byCategory.values());
+    const result = [];
+    while (true) {
+        let any = false;
+        for (const q of queues) {
+            if (q.length > 0) { result.push(q.shift()); any = true; }
+        }
+        if (!any) break;
+    }
+    return result;
+}
 /* ---- all category values present in the seed deck, for the Settings multi-select ---- */
 const ALL_CATEGORIES = Array.from(new Set(SEED.map((c) => c.cat))).sort();
 /* ---- "Embedded-flavor" preset: categories prep.md flags as high-yield for an
@@ -242,9 +262,15 @@ export default function App() {
         const s = sched[c.id];
         return s && s.status !== "new" && diffDays(t, s.due) <= 0;
     }), [cards, sched, t]);
-    const newCards = useMemo(() => cards
-        .filter((c) => !sched[c.id] || sched[c.id].status === "new")
-        .sort((a, b) => RISK_RANK[a.risk] - RISK_RANK[b.risk] || a.order - b.order), [cards, sched]);
+    const newCards = useMemo(() => {
+        const filtered = cards
+            .filter((c) => !sched[c.id] || sched[c.id].status === "new")
+            .sort((a, b) => RISK_RANK[a.risk] - RISK_RANK[b.risk] || a.order - b.order);
+        // Group by risk tier then interleave across categories within each tier
+        const tiers = [[], [], []]; // indices: High=0, Med=1, Low=2
+        for (const c of filtered) tiers[RISK_RANK[c.risk]].push(c);
+        return tiers.flatMap(roundRobinByCategory);
+    }, [cards, sched]);
     const learnedCount = cards.filter((c) => sched[c.id] && sched[c.id].status !== "new").length;
     /* ---- split new cards into priority / standard pools by category ---- */
     const prioritySet = useMemo(() => new Set(settings.priorityCategories || []), [settings.priorityCategories]);
@@ -306,7 +332,17 @@ export default function App() {
         }
         const newSelection = [...picked, ...standardPicked];
         const ids = [
-            ...dueCards.sort((a, b) => diffDays(sched[b.id].due, sched[a.id].due)).map((c) => c.id),
+            ...(() => {
+                const sorted = [...dueCards].sort((a, b) => diffDays(sched[b.id].due, sched[a.id].due));
+                // Within same-due-date bucket, interleave across categories
+                const buckets = new Map();
+                for (const c of sorted) {
+                    const k = sched[c.id].due;
+                    if (!buckets.has(k)) buckets.set(k, []);
+                    buckets.get(k).push(c);
+                }
+                return Array.from(buckets.values()).flatMap(roundRobinByCategory);
+            })().map((c) => c.id),
             ...newSelection.map((c) => c.id),
         ];
         setQueue(ids);
@@ -569,7 +605,7 @@ function Review({ current, revealed, setRevealed, getSched, getBack, remaining, 
     ];
     return (React.createElement("div", null,
         React.createElement("div", { className: "flex items-center justify-between", style: { marginBottom: 10 } },
-            React.createElement("span", { style: { fontFamily: MONO, fontSize: 12, color: T.sub } }, current.cat),
+            React.createElement("span", { style: { fontFamily: MONO, fontSize: 12, color: T.sub } }, revealed ? current.cat : " "),
             React.createElement("span", { style: { fontFamily: MONO, fontSize: 12, color: T.faint } },
                 remaining,
                 " left")),
@@ -698,7 +734,7 @@ function Browse({ cards, sched, getBack, t, onEdit }) {
                             React.createElement("span", { style: { width: 7, height: 7, borderRadius: 999, background: RISK_COLOR[c.risk] } }),
                             React.createElement("span", { style: { fontFamily: MONO, fontSize: 11, color: st.color, width: 30, textAlign: "right" } }, st.label))),
                     isOpen && (React.createElement("div", { style: { padding: "0 12px 12px" } },
-                        React.createElement("textarea", { defaultValue: getBack(c.id), onBlur: (e) => onEdit(c.id, e.target.value), placeholder: "Paste or write your approach + complexity here\u2026", rows: 4, style: {
+                        React.createElement("textarea", { defaultValue: getBack(c.id), onBlur: (e) => onEdit(c.id, e.target.value), placeholder: "Paste or write your approach + complexity here\u2026", rows: Math.max(4, (getBack(c.id).match(/\n/g) || []).length + 1), style: {
                                 width: "100%", padding: "9px 10px", border: `1px solid ${T.line}`,
                                 borderRadius: 8, fontFamily: SANS, fontSize: 13, lineHeight: 1.5,
                                 color: T.ink, background: T.canvas, resize: "vertical", outline: "none",
