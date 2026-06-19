@@ -575,6 +575,28 @@ export default function App() {
         setQueue((q) => [...q, ...moreToPull]);
         setRevealed(false);
     }, [moreToPull]);
+    /* ---- pull a specific problem into today's queue from Browse ----
+     * Rehearsed cards (status !== "new") jump to the front of the queue so
+     * they're reviewed next; brand-new cards join the new-card tail. This is
+     * an explicit user action, so it deliberately bypasses the daily new-card
+     * budget / high-decay cap. We don't touch `sched`: grading reschedules
+     * from today as usual. When a card is revealed mid-review we slot the
+     * pulled card behind it rather than yanking the current card away. */
+    const addToToday = useCallback((id) => {
+        if (!cardById.has(id))
+            return;
+        setQueue((q) => {
+            const without = q.filter((x) => x !== id);
+            const s = sched[id];
+            const rehearsed = !!s && s.status !== "new";
+            if (rehearsed) {
+                const at = revealed ? 1 : 0;
+                return [...without.slice(0, at), id, ...without.slice(at)];
+            }
+            return [...without, id];
+        });
+        setView("review");
+    }, [sched, revealed, cardById]);
     /* ---- rate ---- */
     const rate = (grade) => {
         if (!current)
@@ -642,7 +664,7 @@ export default function App() {
                     .map((s) => diffDays(t, s.due))
                     .filter((d) => d > 0)
                     .sort((a, b) => a - b)[0] })),
-            view === "browse" && (React.createElement(Browse, { cards: cards, sched: sched, getBack: getBack, t: t, onEdit: (id, text) => persist({ backs: { ...backs, [id]: text } }) })),
+            view === "browse" && (React.createElement(Browse, { cards: cards, sched: sched, getBack: getBack, t: t, onEdit: (id, text) => persist({ backs: { ...backs, [id]: text } }), onAddToToday: addToToday, inQueue: new Set(queue) })),
             view === "import" && (React.createElement(Importer, { cardById: cardById, onApply: (newBacks, newCards) => persist({
                     backs: { ...backs, ...newBacks },
                     extra: [...extra, ...newCards],
@@ -910,7 +932,7 @@ function UpcomingStrip({ upcoming, maxBin }) {
             React.createElement("span", null, "+14"))));
 }
 /* ---------------------------- Browse ---------------------------- */
-function Browse({ cards, sched, getBack, t, onEdit }) {
+function Browse({ cards, sched, getBack, t, onEdit, onAddToToday, inQueue }) {
     const [q, setQ] = useState("");
     const [riskF, setRiskF] = useState("All");
     const [open, setOpen] = useState(null);
@@ -960,7 +982,20 @@ function Browse({ cards, sched, getBack, t, onEdit }) {
                                 borderRadius: 8, fontFamily: SANS, fontSize: 13, lineHeight: 1.5,
                                 color: T.ink, background: T.canvas, resize: "vertical", outline: "none",
                             } }),
-                        React.createElement("div", { style: { fontSize: 11, color: T.faint, marginTop: 4 } }, "Saves when you click away.")))));
+                        React.createElement("div", { className: "flex items-center justify-between", style: { marginTop: 6, gap: 8 } },
+                            React.createElement("span", { style: { fontSize: 11, color: T.faint } }, "Saves when you click away."),
+                            (() => {
+                                const queued = inQueue.has(c.id);
+                                const label = queued ? "\u2713 In today\u2019s queue"
+                                    : st.label === "new" ? "\u2795 Add to today"
+                                        : "\u2795 Pull to front of today";
+                                return React.createElement("button", { onClick: () => onAddToToday(c.id), disabled: queued, style: {
+                                        padding: "6px 11px", borderRadius: 8, border: `1px solid ${T.line}`,
+                                        fontFamily: SANS, fontSize: 12, fontWeight: 600, flexShrink: 0,
+                                        background: queued ? T.canvas : T.paper, color: queued ? T.faint : T.ink,
+                                        cursor: queued ? "default" : "pointer", outline: "none",
+                                    } }, label);
+                            })())))));
             }),
             filtered.length === 0 && (React.createElement("p", { style: { color: T.faint, fontSize: 13.5, textAlign: "center", padding: 24 } }, "No matches.")))));
 }
