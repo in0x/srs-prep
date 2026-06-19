@@ -148,6 +148,26 @@ function flushPushSync() {
     catch (e) { /* non-fatal */ }
 }
 
+// Read the local state blob, ensuring it carries a usable lastModified before
+// we ever seed/push it. Saves predating sync have no timestamp; stamp them once
+// (persisting it) so an empty remote gets seeded and downstream devices can pull.
+function readLocalStamped() {
+    let raw = null;
+    try { raw = localStorage.getItem(STORAGE_KEY); }
+    catch (e) { return null; }
+    if (!raw) return null;
+    let local;
+    try { local = JSON.parse(raw); }
+    catch (e) { return null; }
+    if (!local || typeof local !== "object") return null;
+    if (!local.lastModified) {
+        local.lastModified = Date.now();
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); }
+        catch (e) { /* non-fatal */ }
+    }
+    return local;
+}
+
 /* Shared state migration — applied on boot-load, backup-restore, AND remote
  * pull, so the three paths can never drift (see context.md). Returns the
  * normalized {sched, backs, extra, settings, stats}; queue handling stays
@@ -361,18 +381,14 @@ export default function App() {
         let remote = null;
         try { remote = await pullRemote(); }
         catch (e) { return; /* offline / auth error — keep local, retry next time */ }
-        let local = null;
-        try {
-            const raw = localStorage.getItem(STORAGE_KEY);
-            local = raw ? JSON.parse(raw) : null;
-        }
-        catch (e) { /* ignore */ }
+        const local = readLocalStamped();
         const localMod = (local && local.lastModified) || 0;
         const remoteMod = (remote && remote.lastModified) || 0;
         if (remote && remoteMod > localMod) {
             applyRemote(remote);
         }
-        else if (local && localMod > remoteMod) {
+        else if (local && (!remote || localMod > remoteMod)) {
+            // remote is empty/older — seed or update it with our local state
             pushRemote(local).catch(() => { /* retry next foreground */ });
         }
     }, [applyRemote]);
@@ -628,12 +644,7 @@ export default function App() {
                         return { ok: false, text: "Enter the sync URL and secret first." };
                     try {
                         const remote = await pullRemote();
-                        let local = null;
-                        try {
-                            const raw = localStorage.getItem(STORAGE_KEY);
-                            local = raw ? JSON.parse(raw) : null;
-                        }
-                        catch (e) { /* ignore */ }
+                        const local = readLocalStamped();
                         const localMod = (local && local.lastModified) || 0;
                         const remoteMod = (remote && remote.lastModified) || 0;
                         if (remote && remoteMod > localMod) {
