@@ -1,0 +1,10 @@
+name = "srs-prep-sync"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# KV namespace binding. Create it once with:
+#   wrangler kv namespace create STATE
+# then paste the printed id below.
+[[kv_namespaces]]
+binding = "STATE"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
