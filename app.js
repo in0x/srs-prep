@@ -71,6 +71,143 @@ const DEFAULT_SETTINGS = {
     standardPerDay: 3,
     priorityCategories: EMBEDDED_PRESET,
 };
+/* ================================================================== *
+ * Cross-device sync (optional, opt-in).
+ *
+ * The whole app state is a single JSON blob; syncing just means
+ * push/pull of that one object against a tiny Cloudflare Worker that
+ * gates every request behind a bearer secret. URL + secret are entered
+ * per-device in Settings and live ONLY in localStorage (never in the
+ * repo, never in the exported backup), preserving the privacy model.
+ *
+ * Conflict model: single user, so last-write-wins on a `lastModified`
+ * timestamp is sufficient. See SYNC-SETUP.md for the Worker + deploy.
+ * ------------------------------------------------------------------ */
+const SYNC_URL_KEY = "srs_sync_url";
+const SYNC_SECRET_KEY = "srs_sync_secret";
+const LAST_PUSHED_KEY = "srs_sync_pushed_at"; // lastModified we last got a 200 OK for
+
+function syncConfig() {
+    try {
+        return {
+            url: (localStorage.getItem(SYNC_URL_KEY) || "").trim(),
+            secret: (localStorage.getItem(SYNC_SECRET_KEY) || "").trim(),
+        };
+    }
+    catch (e) { return { url: "", secret: "" }; }
+}
+const syncEnabled = () => { const { url, secret } = syncConfig(); return !!(url && secret); };
+
+async function pullRemote() {
+    const { url, secret } = syncConfig();
+    if (!url || !secret) return null;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${secret}` } });
+    if (res.status === 204) return null; // no remote state stored yet
+    if (!res.ok) throw new Error(`pull failed: HTTP ${res.status}`);
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
+}
+
+async function pushRemote(payload) {
+    const { url, secret } = syncConfig();
+    if (!url || !secret) return false;
+    const res = await fetch(url, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+        try { localStorage.setItem(LAST_PUSHED_KEY, String(payload.lastModified || 0)); }
+        catch (e) { /* non-fatal */ }
+        return true;
+    }
+    return false;
+}
+
+// Best-effort push when the page is backgrounded/unloaded. Correctness does
+// NOT depend on this landing — syncPull() reconciles on next foreground by
+// comparing timestamps. keepalive lets the request survive being backgrounded,
+// but its body is capped at 64KB, so only use it when we're safely under.
+function flushPushSync() {
+    try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        const { url, secret } = syncConfig();
+        if (!raw || !url || !secret) return;
+        const lastPushed = Number(localStorage.getItem(LAST_PUSHED_KEY)) || 0;
+        let mod = 0;
+        try { mod = JSON.parse(raw).lastModified || 0; } catch (e) { /* ignore */ }
+        if (mod <= lastPushed) return; // nothing new since last confirmed push
+        const KEEPALIVE_CAP = 60 * 1024; // stay safely under the 64KB keepalive limit
+        fetch(url, {
+            method: "PUT",
+            headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" },
+            body: raw,
+            keepalive: raw.length <= KEEPALIVE_CAP,
+        }).catch(() => { /* reconciled on next foreground */ });
+    }
+    catch (e) { /* non-fatal */ }
+}
+
+// Read the local state blob, ensuring it carries a usable lastModified before
+// we ever seed/push it. Saves predating sync have no timestamp; stamp them once
+// (persisting it) so an empty remote gets seeded and downstream devices can pull.
+function readLocalStamped() {
+    let raw = null;
+    try { raw = localStorage.getItem(STORAGE_KEY); }
+    catch (e) { return null; }
+    if (!raw) return null;
+    let local;
+    try { local = JSON.parse(raw); }
+    catch (e) { return null; }
+    if (!local || typeof local !== "object") return null;
+    if (!local.lastModified) {
+        local.lastModified = Date.now();
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); }
+        catch (e) { /* non-fatal */ }
+    }
+    return local;
+}
+
+/* Shared state migration — applied on boot-load, backup-restore, AND remote
+ * pull, so the three paths can never drift (see context.md). Returns the
+ * normalized {sched, backs, extra, settings, stats}; queue handling stays
+ * per-call-site because it's date-scoped. */
+function migrateState(s) {
+    const loadedSched = s.sched || {};
+    const migratedSched = {};
+    for (const [id, cardSched] of Object.entries(loadedSched)) {
+        if (cardSched.implAt === undefined) {
+            migratedSched[id] = {
+                ...cardSched,
+                struggleStreak: cardSched.struggleStreak || 0,
+                implAt: cardSched.interval || 0,
+            };
+        }
+        else {
+            migratedSched[id] = cardSched;
+        }
+    }
+    const loadedSettings = s.settings || {};
+    let migratedSettings = loadedSettings;
+    if (loadedSettings.priorityPerDay === undefined || loadedSettings.standardPerDay === undefined) {
+        const total = loadedSettings.newPerDay ?? DEFAULT_SETTINGS.priorityPerDay + DEFAULT_SETTINGS.standardPerDay;
+        const priorityPerDay = Math.max(0, Math.min(total, Math.round(total * 0.6)));
+        migratedSettings = {
+            ...DEFAULT_SETTINGS,
+            ...loadedSettings,
+            priorityPerDay,
+            standardPerDay: Math.max(0, total - priorityPerDay),
+            priorityCategories: loadedSettings.priorityCategories || EMBEDDED_PRESET,
+        };
+    }
+    return {
+        sched: migratedSched,
+        backs: s.backs || {},
+        extra: s.extra || [],
+        settings: migratedSettings,
+        stats: s.stats || { introduced: {}, reviewed: {} },
+    };
+}
 /* ---- date helpers (local, day-grained) ---- */
 const todayStr = () => {
     const d = new Date();
@@ -174,51 +311,12 @@ export default function App() {
             const raw = localStorage.getItem(STORAGE_KEY);
             if (raw) {
                 const s = JSON.parse(raw);
-                let loadedSched = s.sched || {};
-                let migrated = false;
-                const migratedSched = {};
-                for (const [id, cardSched] of Object.entries(loadedSched)) {
-                    if (cardSched.implAt === undefined) {
-                        migratedSched[id] = {
-                            ...cardSched,
-                            struggleStreak: cardSched.struggleStreak || 0,
-                            implAt: cardSched.interval || 0,
-                        };
-                        migrated = true;
-                    }
-                    else {
-                        migratedSched[id] = cardSched;
-                    }
-                }
-                if (migrated) {
-                    loadedSched = migratedSched;
-                    try {
-                        localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...s, sched: migratedSched }));
-                    }
-                    catch (e) { /* non-fatal: storage quota */ }
-                }
-                setSched(loadedSched);
-                setBacks(s.backs || {});
-                setExtra(s.extra || []);
-                // migrate pre-existing settings: old shape had a single `newPerDay`
-                // and no priority-category split. Preserve the user's total intake
-                // by mapping it onto the new priorityPerDay/standardPerDay sliders,
-                // defaulting priority categories to the embedded-flavor preset.
-                const loadedSettings = s.settings || {};
-                let migratedSettings = loadedSettings;
-                if (loadedSettings.priorityPerDay === undefined || loadedSettings.standardPerDay === undefined) {
-                    const total = loadedSettings.newPerDay ?? DEFAULT_SETTINGS.priorityPerDay + DEFAULT_SETTINGS.standardPerDay;
-                    const priorityPerDay = Math.max(0, Math.min(total, Math.round(total * 0.6)));
-                    migratedSettings = {
-                        ...DEFAULT_SETTINGS,
-                        ...loadedSettings,
-                        priorityPerDay,
-                        standardPerDay: Math.max(0, total - priorityPerDay),
-                        priorityCategories: loadedSettings.priorityCategories || EMBEDDED_PRESET,
-                    };
-                }
-                setSettings(migratedSettings);
-                setStats(s.stats || { introduced: {}, reviewed: {} });
+                const m = migrateState(s);
+                setSched(m.sched);
+                setBacks(m.backs);
+                setExtra(m.extra);
+                setSettings(m.settings);
+                setStats(m.stats);
                 // restore today's in-progress queue so a refresh picks up where you left off
                 if (s.queueDate === todayStr() && Array.isArray(s.queue)) {
                     restoredQueueRef.current = s.queue;
@@ -233,10 +331,72 @@ export default function App() {
             if (typeof window.__hideSplash === 'function') window.__hideSplash();
         }
     }, []);
+    /* ---- cross-device sync ---- */
+    const pushTimer = useRef(null);
+    // Debounced push: coalesce rapid writes into at most one PUT per window.
+    // This is the primary write-rate guard (keeps us far under KV's daily cap).
+    const schedulePush = useCallback((payload) => {
+        if (!syncEnabled())
+            return;
+        if (pushTimer.current)
+            clearTimeout(pushTimer.current);
+        pushTimer.current = setTimeout(() => {
+            pushTimer.current = null;
+            pushRemote(payload).catch(() => { /* offline; reconciled on next foreground */ });
+        }, 4000);
+    }, []);
+    // Adopt a remote state blob into live state + localStorage (last-write-wins).
+    const applyRemote = useCallback((s) => {
+        const m = migrateState(s);
+        setSched(m.sched);
+        setBacks(m.backs);
+        setExtra(m.extra);
+        setSettings(m.settings);
+        setStats(m.stats);
+        const restoreQueue = s.queueDate === todayStr() && Array.isArray(s.queue);
+        setQueue(restoreQueue ? s.queue : []);
+        setQueueDate(restoreQueue ? s.queueDate : null);
+        setRevealed(restoreQueue && typeof s.revealed === "boolean" ? s.revealed : false);
+        if (restoreQueue)
+            restoredQueueRef.current = s.queue;
+        const lastModified = s.lastModified || 0;
+        const payload = {
+            sched: m.sched, backs: m.backs, extra: m.extra, settings: m.settings, stats: m.stats,
+            queue: restoreQueue ? s.queue : [],
+            queueDate: restoreQueue ? s.queueDate : null,
+            revealed: restoreQueue ? (s.revealed || false) : false,
+            lastModified,
+        };
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(payload)); }
+        catch (e) { /* non-fatal */ }
+        // remote already holds exactly this state — record it as the last pushed
+        try { localStorage.setItem(LAST_PUSHED_KEY, String(lastModified)); }
+        catch (e) { /* non-fatal */ }
+    }, []);
+    // Pull remote, then resolve: adopt if newer, else push local up if we're
+    // ahead. Safe to call on every foreground — this is the reconciliation net.
+    const syncPull = useCallback(async () => {
+        if (!syncEnabled())
+            return;
+        let remote = null;
+        try { remote = await pullRemote(); }
+        catch (e) { return; /* offline / auth error — keep local, retry next time */ }
+        const local = readLocalStamped();
+        const localMod = (local && local.lastModified) || 0;
+        const remoteMod = (remote && remote.lastModified) || 0;
+        if (remote && remoteMod > localMod) {
+            applyRemote(remote);
+        }
+        else if (local && (!remote || localMod > remoteMod)) {
+            // remote is empty/older — seed or update it with our local state
+            pushRemote(local).catch(() => { /* retry next foreground */ });
+        }
+    }, [applyRemote]);
     /* ---- persist ---- */
     const persist = useCallback((next) => {
         const payload = {
             sched, backs, extra, settings, stats, queue, queueDate, revealed, ...next,
+            lastModified: Date.now(),
         };
         if (next) {
             if (next.sched)
@@ -254,7 +414,24 @@ export default function App() {
             localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
         }
         catch (e) { /* non-fatal: storage quota */ }
-    }, [sched, backs, extra, settings, stats, queue, queueDate, revealed]);
+        schedulePush(payload);
+    }, [sched, backs, extra, settings, stats, queue, queueDate, revealed, schedulePush]);
+    /* ---- sync triggers: initial pull + foreground/background hooks ---- */
+    useEffect(() => {
+        syncPull(); // pull once on load (adopt newer remote, or seed an empty remote)
+        const onVisibility = () => {
+            if (document.visibilityState === "visible")
+                syncPull();
+            else
+                flushPushSync();
+        };
+        document.addEventListener("visibilitychange", onVisibility);
+        window.addEventListener("pagehide", flushPushSync);
+        return () => {
+            document.removeEventListener("visibilitychange", onVisibility);
+            window.removeEventListener("pagehide", flushPushSync);
+        };
+    }, [syncPull]);
     /* ---- derived counts ---- */
     const t = todayStr();
     const introducedToday = stats.introduced[t] || 0;
@@ -461,7 +638,28 @@ export default function App() {
                     backs: { ...backs, ...newBacks },
                     extra: [...extra, ...newCards],
                 }) })),
-            view === "stats" && (React.createElement(Stats, { settings: settings, setPriorityPerDay: (n) => persist({ settings: { ...settings, priorityPerDay: n } }), setStandardPerDay: (n) => persist({ settings: { ...settings, standardPerDay: n } }), setHighPerDay: (n) => persist({ settings: { ...settings, highPerDay: n } }), setPriorityCategories: (cats) => persist({ settings: { ...settings, priorityCategories: cats } }), upcoming: upcoming, maxBin: maxBin, learned: learnedCount, total: cards.length, streak: streak, onExport: () => {
+            view === "stats" && (React.createElement(Stats, { settings: settings, setPriorityPerDay: (n) => persist({ settings: { ...settings, priorityPerDay: n } }), setStandardPerDay: (n) => persist({ settings: { ...settings, standardPerDay: n } }), setHighPerDay: (n) => persist({ settings: { ...settings, highPerDay: n } }), setPriorityCategories: (cats) => persist({ settings: { ...settings, priorityCategories: cats } }), upcoming: upcoming, maxBin: maxBin, learned: learnedCount, total: cards.length, streak: streak, onSyncNow: async () => {
+                    const { url, secret } = syncConfig();
+                    if (!url || !secret)
+                        return { ok: false, text: "Enter the sync URL and secret first." };
+                    try {
+                        const remote = await pullRemote();
+                        const local = readLocalStamped();
+                        const localMod = (local && local.lastModified) || 0;
+                        const remoteMod = (remote && remote.lastModified) || 0;
+                        if (remote && remoteMod > localMod) {
+                            applyRemote(remote);
+                            return { ok: true, text: "Pulled newer progress from another device." };
+                        }
+                        const pushed = local ? await pushRemote(local) : false;
+                        return pushed
+                            ? { ok: true, text: "This device is the latest — synced up." }
+                            : { ok: true, text: "Already in sync." };
+                    }
+                    catch (e) {
+                        return { ok: false, text: "Sync failed: " + e.message };
+                    }
+                }, onExport: () => {
                     const payload = {
                         sched, backs, extra, settings, stats, queue, queueDate, revealed,
                         exportedAt: new Date().toISOString(),
@@ -477,60 +675,35 @@ export default function App() {
                     document.body.removeChild(a);
                     URL.revokeObjectURL(url);
                 }, onImport: (s) => {
-                    // Run the same migrations the load-on-boot path applies, so
-                    // imported backups from older app versions don't crash or
-                    // flood with stale "verify" badges.
-                    let loadedSched = s.sched || {};
-                    const migratedSched = {};
-                    for (const [id, cardSched] of Object.entries(loadedSched)) {
-                        if (cardSched.implAt === undefined) {
-                            migratedSched[id] = {
-                                ...cardSched,
-                                struggleStreak: cardSched.struggleStreak || 0,
-                                implAt: cardSched.interval || 0,
-                            };
-                        }
-                        else {
-                            migratedSched[id] = cardSched;
-                        }
-                    }
-                    const loadedSettings = s.settings || {};
-                    let migratedSettings = loadedSettings;
-                    if (loadedSettings.priorityPerDay === undefined || loadedSettings.standardPerDay === undefined) {
-                        const total = loadedSettings.newPerDay ?? DEFAULT_SETTINGS.priorityPerDay + DEFAULT_SETTINGS.standardPerDay;
-                        const priorityPerDay = Math.max(0, Math.min(total, Math.round(total * 0.6)));
-                        migratedSettings = {
-                            ...DEFAULT_SETTINGS,
-                            ...loadedSettings,
-                            priorityPerDay,
-                            standardPerDay: Math.max(0, total - priorityPerDay),
-                            priorityCategories: loadedSettings.priorityCategories || EMBEDDED_PRESET,
-                        };
-                    }
-                    const newStats = s.stats || { introduced: {}, reviewed: {} };
-                    const newExtra = s.extra || [];
-                    const newBacks = s.backs || {};
+                    // Run the same migrations as boot-load / remote-pull (shared
+                    // migrateState) so imported backups from older app versions
+                    // don't crash or flood with stale "verify" badges.
+                    const m = migrateState(s);
                     const restoreQueue = s.queueDate === todayStr() && Array.isArray(s.queue);
-                    setSched(migratedSched);
-                    setBacks(newBacks);
-                    setExtra(newExtra);
-                    setSettings(migratedSettings);
-                    setStats(newStats);
+                    setSched(m.sched);
+                    setBacks(m.backs);
+                    setExtra(m.extra);
+                    setSettings(m.settings);
+                    setStats(m.stats);
                     setQueue(restoreQueue ? s.queue : []);
                     setQueueDate(restoreQueue ? s.queueDate : null);
                     setRevealed(restoreQueue && typeof s.revealed === "boolean" ? s.revealed : false);
                     if (restoreQueue)
                         restoredQueueRef.current = s.queue;
+                    // Stamp a fresh timestamp so the restored backup wins LWW and
+                    // propagates to other devices rather than being overwritten.
+                    const payload = {
+                        sched: m.sched, backs: m.backs, extra: m.extra, settings: m.settings, stats: m.stats,
+                        queue: restoreQueue ? s.queue : [],
+                        queueDate: restoreQueue ? s.queueDate : null,
+                        revealed: restoreQueue ? (s.revealed || false) : false,
+                        lastModified: Date.now(),
+                    };
                     try {
-                        localStorage.setItem(STORAGE_KEY, JSON.stringify({
-                            sched: migratedSched, backs: newBacks, extra: newExtra,
-                            settings: migratedSettings, stats: newStats,
-                            queue: restoreQueue ? s.queue : [],
-                            queueDate: restoreQueue ? s.queueDate : null,
-                            revealed: restoreQueue ? (s.revealed || false) : false,
-                        }));
+                        localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
                     }
                     catch (e) { /* non-fatal: storage quota */ }
+                    schedulePush(payload);
                 }, onReset: () => {
                     try {
                         localStorage.removeItem(STORAGE_KEY);
@@ -927,10 +1100,24 @@ function Importer({ cardById, onApply }) {
     ));
 }
 /* ---------------------------- Stats / Settings ---------------------------- */
-function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, setPriorityCategories, upcoming, maxBin, learned, total, streak, onExport, onImport, onReset }) {
+function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, setPriorityCategories, upcoming, maxBin, learned, total, streak, onExport, onImport, onReset, onSyncNow }) {
     const [confirm, setConfirm] = useState(false);
     const [importMsg, setImportMsg] = useState(null); // { ok: bool, text: string }
     const fileInputRef = useRef(null);
+    // Cross-device sync config — stored only in localStorage on this device.
+    const [syncUrl, setSyncUrl] = useState(() => { try { return localStorage.getItem(SYNC_URL_KEY) || ""; } catch (e) { return ""; } });
+    const [syncSecret, setSyncSecret] = useState(() => { try { return localStorage.getItem(SYNC_SECRET_KEY) || ""; } catch (e) { return ""; } });
+    const [syncMsg, setSyncMsg] = useState(null); // { ok, text }
+    const [syncing, setSyncing] = useState(false);
+    const saveSyncUrl = (v) => { setSyncUrl(v); setSyncMsg(null); try { localStorage.setItem(SYNC_URL_KEY, v.trim()); } catch (e) {} };
+    const saveSyncSecret = (v) => { setSyncSecret(v); setSyncMsg(null); try { localStorage.setItem(SYNC_SECRET_KEY, v.trim()); } catch (e) {} };
+    const doSyncNow = async () => {
+        setSyncing(true);
+        setSyncMsg(null);
+        try { setSyncMsg(await onSyncNow()); }
+        catch (e) { setSyncMsg({ ok: false, text: "Sync failed: " + e.message }); }
+        finally { setSyncing(false); }
+    };
     const handleFile = (e) => {
         const file = e.target.files && e.target.files[0];
         if (!file)
@@ -1003,6 +1190,38 @@ function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, 
                 React.createElement(Mini, { label: "Streak", value: `${streak}d`, color: T.indigo }),
                 React.createElement(Mini, { label: "Due now", value: upcoming[0], color: T.amber })),
             React.createElement(UpcomingStrip, { upcoming: upcoming, maxBin: maxBin })),
+        React.createElement(Section, { title: "Sync across devices" },
+            React.createElement("p", { style: { fontSize: 13, color: T.sub, lineHeight: 1.5, marginBottom: 10 } }, "Sync progress between your devices via your own free Cloudflare Worker. Paste its URL and your secret below — both are stored only on this device and never included in backups. See SYNC-SETUP.md to deploy the Worker."),
+            React.createElement("input", {
+                value: syncUrl,
+                onChange: (e) => saveSyncUrl(e.target.value),
+                placeholder: "https://your-worker.workers.dev",
+                style: {
+                    width: "100%", padding: "9px 12px", border: `1px solid ${T.line}`, borderRadius: 9,
+                    fontFamily: MONO, fontSize: 12, color: T.ink, background: T.canvas, outline: "none", marginBottom: 8,
+                }
+            }),
+            React.createElement("input", {
+                value: syncSecret,
+                onChange: (e) => saveSyncSecret(e.target.value),
+                type: "password",
+                placeholder: "sync secret",
+                style: {
+                    width: "100%", padding: "9px 12px", border: `1px solid ${T.line}`, borderRadius: 9,
+                    fontFamily: MONO, fontSize: 12, color: T.ink, background: T.canvas, outline: "none", marginBottom: 10,
+                }
+            }),
+            React.createElement("button", {
+                onClick: doSyncNow,
+                disabled: !syncUrl.trim() || !syncSecret.trim() || syncing,
+                style: {
+                    padding: "9px 16px", cursor: (syncUrl.trim() && syncSecret.trim() && !syncing) ? "pointer" : "default",
+                    background: (syncUrl.trim() && syncSecret.trim() && !syncing) ? T.indigo : T.line,
+                    color: T.paper, border: "none", borderRadius: 9, fontFamily: SANS, fontSize: 13.5, fontWeight: 600,
+                }
+            }, syncing ? "Syncing…" : "↻ Sync now"),
+            syncMsg && React.createElement("p", { style: { fontSize: 12.5, color: syncMsg.ok ? T.green : T.red, marginTop: 8, lineHeight: 1.5 } }, syncMsg.text),
+            React.createElement("p", { style: { fontSize: 12, color: T.faint, marginTop: 8, lineHeight: 1.5 } }, "Once configured, sync runs automatically — changes push shortly after you make them, and the latest progress is pulled when you switch back to this device. The button is just a manual nudge.")),
         React.createElement(Section, { title: "Backup" },
             React.createElement("p", { style: { fontSize: 13, color: T.sub, marginBottom: 10 } }, "Export your scheduling data, notes, and stats as a JSON file. Restore from a backup to overwrite your current progress on this device."),
             React.createElement("div", { className: "flex", style: { gap: 8, flexWrap: "wrap" } },
