@@ -148,23 +148,29 @@ function flushPushSync() {
     catch (e) { /* non-fatal */ }
 }
 
-// Read the local state blob, ensuring it carries a usable lastModified before
-// we ever seed/push it. Saves predating sync have no timestamp; stamp them once
-// (persisting it) so an empty remote gets seeded and downstream devices can pull.
-function readLocalStamped() {
+// Read the local state blob (no mutation). A save predating sync has no
+// lastModified; callers treat that as 0 (older than any timestamped remote),
+// so a fresh device adopts the cloud rather than clobbering it.
+function readLocal() {
     let raw = null;
     try { raw = localStorage.getItem(STORAGE_KEY); }
     catch (e) { return null; }
     if (!raw) return null;
-    let local;
-    try { local = JSON.parse(raw); }
-    catch (e) { return null; }
-    if (!local || typeof local !== "object") return null;
-    if (!local.lastModified) {
-        local.lastModified = Date.now();
-        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); }
-        catch (e) { /* non-fatal */ }
+    try {
+        const o = JSON.parse(raw);
+        return (o && typeof o === "object") ? o : null;
     }
+    catch (e) { return null; }
+}
+
+// Stamp local with a fresh timestamp and persist it. Used ONLY when seeding an
+// empty cloud (or forcing a push), so the stored copy has a usable lastModified
+// for other devices — never during a plain comparison, which would wrongly make
+// a stale device look newest.
+function stampLocal(local) {
+    local.lastModified = Date.now();
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); }
+    catch (e) { /* non-fatal */ }
     return local;
 }
 
@@ -381,14 +387,17 @@ export default function App() {
         let remote = null;
         try { remote = await pullRemote(); }
         catch (e) { return; /* offline / auth error — keep local, retry next time */ }
-        const local = readLocalStamped();
+        const local = readLocal();
         const localMod = (local && local.lastModified) || 0;
         const remoteMod = (remote && remote.lastModified) || 0;
         if (remote && remoteMod > localMod) {
-            applyRemote(remote);
+            applyRemote(remote); // remote is newer — adopt it
         }
-        else if (local && (!remote || localMod > remoteMod)) {
-            // remote is empty/older — seed or update it with our local state
+        else if (local && !remote) {
+            // cloud is empty — seed it (stamp so other devices can pull)
+            pushRemote(stampLocal(local)).catch(() => { /* retry next foreground */ });
+        }
+        else if (local && localMod > remoteMod) {
             pushRemote(local).catch(() => { /* retry next foreground */ });
         }
     }, [applyRemote]);
@@ -644,20 +653,59 @@ export default function App() {
                         return { ok: false, text: "Enter the sync URL and secret first." };
                     try {
                         const remote = await pullRemote();
-                        const local = readLocalStamped();
+                        const local = readLocal();
                         const localMod = (local && local.lastModified) || 0;
                         const remoteMod = (remote && remote.lastModified) || 0;
                         if (remote && remoteMod > localMod) {
                             applyRemote(remote);
                             return { ok: true, text: "Pulled newer progress from another device." };
                         }
-                        const pushed = local ? await pushRemote(local) : false;
-                        return pushed
-                            ? { ok: true, text: "This device is the latest — synced up." }
-                            : { ok: true, text: "Already in sync." };
+                        if (local && !remote) {
+                            const seeded = await pushRemote(stampLocal(local));
+                            return seeded
+                                ? { ok: true, text: "Seeded the cloud with this device's progress." }
+                                : { ok: false, text: "Push was rejected." };
+                        }
+                        if (local && localMod > remoteMod) {
+                            const pushed = await pushRemote(local);
+                            return pushed
+                                ? { ok: true, text: "This device is the latest — synced up." }
+                                : { ok: false, text: "Push was rejected." };
+                        }
+                        return { ok: true, text: "Already in sync." };
                     }
                     catch (e) {
                         return { ok: false, text: "Sync failed: " + e.message };
+                    }
+                }, onForcePush: async () => {
+                    const { url, secret } = syncConfig();
+                    if (!url || !secret)
+                        return { ok: false, text: "Enter the sync URL and secret first." };
+                    const local = readLocal();
+                    if (!local)
+                        return { ok: false, text: "No local progress on this device to push." };
+                    try {
+                        const ok = await pushRemote(stampLocal(local));
+                        return ok
+                            ? { ok: true, text: "Pushed this device's progress to the cloud — it's now the source of truth." }
+                            : { ok: false, text: "Push was rejected." };
+                    }
+                    catch (e) {
+                        return { ok: false, text: "Push failed: " + e.message };
+                    }
+                }, onForcePull: async () => {
+                    const { url, secret } = syncConfig();
+                    if (!url || !secret)
+                        return { ok: false, text: "Enter the sync URL and secret first." };
+                    try {
+                        const remote = await pullRemote();
+                        if (!remote)
+                            return { ok: false, text: "Nothing is stored in the cloud yet." };
+                        applyRemote(remote);
+                        return { ok: true, text: "Replaced this device's progress with the cloud's copy." };
+                    }
+                    catch (e) {
+                        return { ok: false, text: "Pull failed: " + e.message };
                     }
                 }, onExport: () => {
                     const payload = {
@@ -1100,7 +1148,7 @@ function Importer({ cardById, onApply }) {
     ));
 }
 /* ---------------------------- Stats / Settings ---------------------------- */
-function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, setPriorityCategories, upcoming, maxBin, learned, total, streak, onExport, onImport, onReset, onSyncNow }) {
+function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, setPriorityCategories, upcoming, maxBin, learned, total, streak, onExport, onImport, onReset, onSyncNow, onForcePush, onForcePull }) {
     const [confirm, setConfirm] = useState(false);
     const [importMsg, setImportMsg] = useState(null); // { ok: bool, text: string }
     const fileInputRef = useRef(null);
@@ -1109,15 +1157,20 @@ function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, 
     const [syncSecret, setSyncSecret] = useState(() => { try { return localStorage.getItem(SYNC_SECRET_KEY) || ""; } catch (e) { return ""; } });
     const [syncMsg, setSyncMsg] = useState(null); // { ok, text }
     const [syncing, setSyncing] = useState(false);
+    const [confirmPull, setConfirmPull] = useState(false);
     const saveSyncUrl = (v) => { setSyncUrl(v); setSyncMsg(null); try { localStorage.setItem(SYNC_URL_KEY, v.trim()); } catch (e) {} };
     const saveSyncSecret = (v) => { setSyncSecret(v); setSyncMsg(null); try { localStorage.setItem(SYNC_SECRET_KEY, v.trim()); } catch (e) {} };
-    const doSyncNow = async () => {
+    const runSync = async (fn) => {
         setSyncing(true);
         setSyncMsg(null);
-        try { setSyncMsg(await onSyncNow()); }
+        try { setSyncMsg(await fn()); }
         catch (e) { setSyncMsg({ ok: false, text: "Sync failed: " + e.message }); }
         finally { setSyncing(false); }
     };
+    const doSyncNow = () => runSync(onSyncNow);
+    const doForcePush = () => runSync(onForcePush);
+    const doForcePull = () => { setConfirmPull(false); runSync(onForcePull); };
+    const syncReady = !!(syncUrl.trim() && syncSecret.trim()) && !syncing;
     const handleFile = (e) => {
         const file = e.target.files && e.target.files[0];
         if (!file)
@@ -1211,17 +1264,31 @@ function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, 
                     fontFamily: MONO, fontSize: 12, color: T.ink, background: T.canvas, outline: "none", marginBottom: 10,
                 }
             }),
-            React.createElement("button", {
-                onClick: doSyncNow,
-                disabled: !syncUrl.trim() || !syncSecret.trim() || syncing,
-                style: {
-                    padding: "9px 16px", cursor: (syncUrl.trim() && syncSecret.trim() && !syncing) ? "pointer" : "default",
-                    background: (syncUrl.trim() && syncSecret.trim() && !syncing) ? T.indigo : T.line,
-                    color: T.paper, border: "none", borderRadius: 9, fontFamily: SANS, fontSize: 13.5, fontWeight: 600,
-                }
-            }, syncing ? "Syncing…" : "↻ Sync now"),
+            React.createElement("div", { className: "flex", style: { gap: 8, flexWrap: "wrap" } },
+                React.createElement("button", {
+                    onClick: doSyncNow, disabled: !syncReady,
+                    style: { padding: "9px 16px", cursor: syncReady ? "pointer" : "default", background: syncReady ? T.indigo : T.line, color: T.paper, border: "none", borderRadius: 9, fontFamily: SANS, fontSize: 13.5, fontWeight: 600 }
+                }, syncing ? "Syncing…" : "↻ Sync now"),
+                React.createElement("button", {
+                    onClick: doForcePush, disabled: !syncReady,
+                    style: { padding: "9px 14px", cursor: syncReady ? "pointer" : "default", background: T.paper, color: T.indigo, border: `1.5px solid ${T.indigo}`, borderRadius: 9, fontFamily: SANS, fontSize: 13, fontWeight: 600 }
+                }, "↑ Push this device"),
+                !confirmPull
+                    ? React.createElement("button", {
+                        onClick: () => { setSyncMsg(null); setConfirmPull(true); }, disabled: !syncReady,
+                        style: { padding: "9px 14px", cursor: syncReady ? "pointer" : "default", background: T.paper, color: T.sub, border: `1px solid ${T.line}`, borderRadius: 9, fontFamily: SANS, fontSize: 13, fontWeight: 600 }
+                    }, "↓ Pull to this device")
+                    : React.createElement("div", { className: "flex", style: { gap: 6 } },
+                        React.createElement("button", {
+                            onClick: doForcePull, disabled: !syncReady,
+                            style: { padding: "9px 12px", cursor: syncReady ? "pointer" : "default", background: T.red, color: T.paper, border: "none", borderRadius: 9, fontFamily: SANS, fontSize: 13, fontWeight: 600 }
+                        }, "Overwrite this device"),
+                        React.createElement("button", {
+                            onClick: () => setConfirmPull(false),
+                            style: { padding: "9px 12px", cursor: "pointer", background: T.paper, color: T.sub, border: `1px solid ${T.line}`, borderRadius: 9, fontFamily: SANS, fontSize: 13 }
+                        }, "Cancel"))),
             syncMsg && React.createElement("p", { style: { fontSize: 12.5, color: syncMsg.ok ? T.green : T.red, marginTop: 8, lineHeight: 1.5 } }, syncMsg.text),
-            React.createElement("p", { style: { fontSize: 12, color: T.faint, marginTop: 8, lineHeight: 1.5 } }, "Once configured, sync runs automatically — changes push shortly after you make them, and the latest progress is pulled when you switch back to this device. The button is just a manual nudge.")),
+            React.createElement("p", { style: { fontSize: 12, color: T.faint, marginTop: 8, lineHeight: 1.5 } }, "Sync runs automatically once configured. For first-time setup: on the device with the progress you want to keep, tap “Push this device” to make it the source of truth; on every other device, tap “Pull to this device” to overwrite it with the cloud copy.")),
         React.createElement(Section, { title: "Backup" },
             React.createElement("p", { style: { fontSize: 13, color: T.sub, marginBottom: 10 } }, "Export your scheduling data, notes, and stats as a JSON file. Restore from a backup to overwrite your current progress on this device."),
             React.createElement("div", { className: "flex", style: { gap: 8, flexWrap: "wrap" } },

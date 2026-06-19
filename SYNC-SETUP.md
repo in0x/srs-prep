@@ -53,12 +53,17 @@ for you — it requires logging into your own Cloudflare account.
    Wrangler prints your Worker URL, e.g. `https://srs-prep-sync.<you>.workers.dev`.
 
 6. **Connect each device:** open the app → **Settings → Sync across devices**,
-   paste the Worker URL and the same secret, and tap **Sync now**. Repeat on
-   every device with the *same* URL and secret.
+   paste the Worker URL and the same secret. Then, to set the initial
+   direction deterministically (rather than relying on timestamps):
+   - On the device that has the progress you want to keep, tap
+     **↑ Push this device** — this makes it the source of truth in the cloud.
+   - On every *other* device, tap **↓ Pull to this device** to overwrite that
+     device with the cloud copy.
 
 That's it. After that, sync is automatic: changes push a few seconds after you
 make them, and the latest progress is pulled whenever you switch back to a
-device.
+device. **Tip:** export a backup (Settings → Backup) on your main device before
+first-time setup, just in case.
 
 ---
 
