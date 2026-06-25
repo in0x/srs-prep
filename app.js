@@ -69,6 +69,7 @@ const DEFAULT_SETTINGS = {
     highPerDay: 3,
     priorityPerDay: 5,
     standardPerDay: 3,
+    reviewsPerDay: 0, // max due reviews added to the daily queue (0 = no limit)
     priorityCategories: EMBEDDED_PRESET,
 };
 /* ================================================================== *
@@ -517,24 +518,30 @@ export default function App() {
             }
         }
         const newSelection = [...picked, ...standardPicked];
+        const dueOrdered = (() => {
+            const sorted = [...dueCards].sort((a, b) => diffDays(sched[b.id].due, sched[a.id].due));
+            // Within same-due-date bucket, interleave across categories
+            const buckets = new Map();
+            for (const c of sorted) {
+                const k = sched[c.id].due;
+                if (!buckets.has(k)) buckets.set(k, []);
+                buckets.get(k).push(c);
+            }
+            return Array.from(buckets.values()).flatMap(roundRobinByCategory);
+        })();
+        // optional daily cap on how many due reviews enter the queue (0 = no cap).
+        // dueOrdered is most-overdue-first, so we keep the oldest reviews and let
+        // the rest roll over to a later day — they stay due, just not today.
+        const reviewCap = settings.reviewsPerDay || 0;
+        const dueSelection = reviewCap > 0 ? dueOrdered.slice(0, reviewCap) : dueOrdered;
         const ids = [
-            ...(() => {
-                const sorted = [...dueCards].sort((a, b) => diffDays(sched[b.id].due, sched[a.id].due));
-                // Within same-due-date bucket, interleave across categories
-                const buckets = new Map();
-                for (const c of sorted) {
-                    const k = sched[c.id].due;
-                    if (!buckets.has(k)) buckets.set(k, []);
-                    buckets.get(k).push(c);
-                }
-                return Array.from(buckets.values()).flatMap(roundRobinByCategory);
-            })().map((c) => c.id),
+            ...dueSelection.map((c) => c.id),
             ...newSelection.map((c) => c.id),
         ];
         setQueue(ids);
         setQueueDate(t);
         setRevealed(false);
-    }, [dueCards, priorityNewCards, standardNewCards, sched, settings.priorityPerDay, settings.standardPerDay, settings.highPerDay, introducedToday, stats, t, cardById]);
+    }, [dueCards, priorityNewCards, standardNewCards, sched, settings.priorityPerDay, settings.standardPerDay, settings.highPerDay, settings.reviewsPerDay, introducedToday, stats, t, cardById]);
     useEffect(() => { if (loaded && queueDate === null)
         buildQueue(); }, [loaded, queueDate, buildQueue]);
     /* ---- persist queue position so a refresh picks up where you left off ---- */
@@ -669,7 +676,7 @@ export default function App() {
                     backs: { ...backs, ...newBacks },
                     extra: [...extra, ...newCards],
                 }) })),
-            view === "stats" && (React.createElement(Stats, { settings: settings, setPriorityPerDay: (n) => persist({ settings: { ...settings, priorityPerDay: n } }), setStandardPerDay: (n) => persist({ settings: { ...settings, standardPerDay: n } }), setHighPerDay: (n) => persist({ settings: { ...settings, highPerDay: n } }), setPriorityCategories: (cats) => persist({ settings: { ...settings, priorityCategories: cats } }), upcoming: upcoming, maxBin: maxBin, learned: learnedCount, total: cards.length, streak: streak, onSyncNow: async () => {
+            view === "stats" && (React.createElement(Stats, { settings: settings, setPriorityPerDay: (n) => persist({ settings: { ...settings, priorityPerDay: n } }), setStandardPerDay: (n) => persist({ settings: { ...settings, standardPerDay: n } }), setHighPerDay: (n) => persist({ settings: { ...settings, highPerDay: n } }), setReviewsPerDay: (n) => persist({ settings: { ...settings, reviewsPerDay: n } }), setPriorityCategories: (cats) => persist({ settings: { ...settings, priorityCategories: cats } }), upcoming: upcoming, maxBin: maxBin, learned: learnedCount, total: cards.length, streak: streak, onSyncNow: async () => {
                     const { url, secret } = syncConfig();
                     if (!url || !secret)
                         return { ok: false, text: "Enter the sync URL and secret first." };
@@ -1183,7 +1190,7 @@ function Importer({ cardById, onApply }) {
     ));
 }
 /* ---------------------------- Stats / Settings ---------------------------- */
-function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, setPriorityCategories, upcoming, maxBin, learned, total, streak, onExport, onImport, onReset, onSyncNow, onForcePush, onForcePull }) {
+function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, setReviewsPerDay, setPriorityCategories, upcoming, maxBin, learned, total, streak, onExport, onImport, onReset, onSyncNow, onForcePush, onForcePull }) {
     const [confirm, setConfirm] = useState(false);
     const [importMsg, setImportMsg] = useState(null); // { ok: bool, text: string }
     const fileInputRef = useRef(null);
@@ -1272,6 +1279,11 @@ function Stats({ settings, setPriorityPerDay, setStandardPerDay, setHighPerDay, 
             React.createElement("div", { className: "flex items-center", style: { gap: 12 } },
                 React.createElement("input", { type: "range", min: 1, max: 10, value: settings.highPerDay, onChange: (e) => setHighPerDay(Number(e.target.value)), style: { flex: 1, accentColor: T.riskHigh } }),
                 React.createElement("span", { style: { fontFamily: MONO, fontSize: 18, fontWeight: 600, width: 28, textAlign: "right", color: T.riskHigh } }, settings.highPerDay))),
+        React.createElement(Section, { title: "Reviews to repeat per day" },
+            React.createElement("p", { style: { fontSize: 13, color: T.sub, marginBottom: 10 } }, "Cap on how many due problems-to-repeat are added to the daily queue. The most overdue come first; the rest stay due and roll over to a later day. Set to 0 for no limit."),
+            React.createElement("div", { className: "flex items-center", style: { gap: 12 } },
+                React.createElement("input", { type: "range", min: 0, max: 50, value: settings.reviewsPerDay || 0, onChange: (e) => setReviewsPerDay(Number(e.target.value)), style: { flex: 1, accentColor: T.indigo } }),
+                React.createElement("span", { style: { fontFamily: MONO, fontSize: 18, fontWeight: 600, width: 40, textAlign: "right" } }, (settings.reviewsPerDay || 0) === 0 ? "Off" : settings.reviewsPerDay))),
         React.createElement(Section, { title: "Progress" },
             React.createElement("div", { className: "flex", style: { gap: 16 } },
                 React.createElement(Mini, { label: "Learned", value: `${learned}/${total}`, color: T.green }),
